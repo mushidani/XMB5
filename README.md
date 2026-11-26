@@ -65,7 +65,7 @@ XMB5 is more than a visual theme. It introduces a completely different way to na
       <p align="center"><b>Dynamic Game Backgrounds</b></p>
     </td>
     <td width="50%">
-      <img src="docs/previews/preview-3.png" alt="XMB Home">
+      <img src="docs/previews/preview-4.png" alt="XMB Home">
       <p align="center"><b>Classic XMB Interface</b></p>
     </td>
   </tr>
