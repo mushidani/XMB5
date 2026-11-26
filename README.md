@@ -75,7 +75,7 @@ XMB5 is more than a visual theme. It introduces a completely different way to na
       <p align="center"><b>Folders and Submenus</b></p>
     </td>
     <td width="50%">
-      <img src="docs/previews/preview-4.png" alt="Custom Categories">
+      <img src="docs/previews/preview-5.png" alt="Custom Categories">
       <p align="center"><b>Custom Categories</b></p>
     </td>
   </tr>
