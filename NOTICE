@@ -18,8 +18,7 @@ attributions):
   A modified version must say that it is modified and must not present
   itself as the original ZhiThemes.
 
-Based on OnionHEN (https://github.com/aydencharles/onionHEN),
-Copyright (C) its authors, GNU GPL v3. The files under src/ come from
-OnionHEN; the ZhiThemes changes are listed in src/ZHITHEMES_CHANGES.md.
+Copyright (C) its authors, GNU GPL v3. 
+The ZhiThemes changes are listed in src/ZHITHEMES_CHANGES.md.
 
 Third-party code under src/third_party keeps its own license.
