@@ -43,7 +43,6 @@ XMB5 is more than a visual theme. It introduces a completely different way to na
 - Native XMB-style Home interface.
 - Classic horizontal and vertical navigation.
 - PS3-inspired startup experience.
-- Animated wave backgrounds.
 - Monthly wave colors with day and night variations.
 - Custom categories, folders and icons.
 - Custom game and application organization.
@@ -53,8 +52,6 @@ XMB5 is more than a visual theme. It introduces a completely different way to na
 - PS3, PS4 and PS5 platform indicators.
 - Photo, music and video browsing.
 - Customizable interface and appearance.
-- Classic date and animated clock display.
-- Return to the original PS5 Home interface.
 
 ## Screenshots
 
