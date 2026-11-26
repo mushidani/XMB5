@@ -43,6 +43,7 @@ XMB5 is more than a visual theme. It introduces a completely different way to na
 - Native XMB-style Home interface.
 - Classic horizontal and vertical navigation.
 - PS3-inspired startup experience.
+- Animated wave backgrounds.
 - Monthly wave colors with day and night variations.
 - Custom categories, folders and icons.
 - Custom game and application organization.
@@ -52,6 +53,8 @@ XMB5 is more than a visual theme. It introduces a completely different way to na
 - PS3, PS4 and PS5 platform indicators.
 - Photo, music and video browsing.
 - Customizable interface and appearance.
+- Classic date and animated clock display.
+- Return to the original PS5 Home interface.
 
 ## Screenshots
 
@@ -80,14 +83,11 @@ XMB5 is more than a visual theme. It introduces a completely different way to na
 
 ## Compatibility
 
-| Firmware | Status |
-| :--- | :--- |
-| 13.60 | Tested |
-| Other firmware versions | Not yet verified |
+**Supported firmware versions:**
+
+**4.03, 6.02, 7.00** and **9.00 to 13.60**
 
 A compatible jailbreak and ELF payload loader are required.
-
-Compatibility with additional firmware versions will be evaluated through community testing.
 
 ## Downloads
 
@@ -121,7 +121,6 @@ Special thanks to:
 | Project | Contribution |
 | :--- | :--- |
 | [ZhiThemes by Zhi](https://github.com/itsRealZhi/ZhiThemes) | Native PS5 theme engine |
-| [xmb-web by TheGammaSqueeze](https://github.com/TheGammaSqueeze/xmb-web) | XMB rendering and visual reference |
 
 XMB5 is a modified project based on ZhiThemes.
 
