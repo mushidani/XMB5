@@ -1,0 +1,27 @@
+'use strict';
+const fs=require('fs'),path=require('path'),assert=require('assert'),vm=require('vm');
+const b=fs.readFileSync(path.resolve(__dirname,'../xmb_native_bundle.js'),'utf8');
+assert(b.includes('const BADGE = { x: 540, w: 112, h: 25 };'),'badge closer to game details');
+assert(!b.includes('run(exitGhostX[oldCi], direction * 34'),'horizontal afterimage must remain disabled');
+assert(!b.includes('scrollGhostY'),'vertical afterimage must remain disabled');
+const start=b.indexOf('        const Clock = memo(function Clock2(p) {');
+const end=b.indexOf('        const KeepAlive = ',start);
+assert(start>=0&&end>start);
+const h=(type,props,...children)=>({type,props,children});
+const V={CLOCK_ICON_R:16,CLOCK_ICON_CX:1789.5,CLOCK_FRAME_Y:75,CLOCK_FRAME_H:57,CLOCK_FRAME_X:1329,W:1920,CLOCK_FRAME_CORNER:6,CLOCK_SIZE:26,CLOCK_Y:103};
+const Clock=vm.runInNewContext(b.slice(start,end)+'\nClock',{memo:f=>f,h,V,FILL:{position:'absolute'},View:'view',Image:'image',Label:'label',env:{},Math,Date});
+function hands(date){const ch=Clock({now:date}).children; return {hour:ch[3].props.style,minute:ch[4].props.style,dot:ch[5].props.style};}
+const cx=V.CLOCK_ICON_CX, cy=V.CLOCK_FRAME_Y+V.CLOCK_FRAME_H/2;
+const at=(h,m)=>hands(new Date(2026,10,24,h,m,0));
+const a=at(12,0),b3=at(3,15),c=at(6,30),d=at(9,45);
+assert(Math.abs(a.minute.left + a.minute.width/2-cx)<1e-5,'12:00 minute hand rooted at center');
+assert(a.minute.top < cy-a.minute.height*0.9,'12:00 minute hand points up');
+assert(b3.minute.left > cx+2,'3:15 minute hand points right');
+assert(c.minute.top >= cy-0.1,'6:30 minute hand points down');
+assert(d.minute.left < cx-2,'9:45 minute hand points left');
+assert.equal(b3.minute.transform[0].rotate,'90deg');
+assert.equal(c.minute.transform[0].rotate,'180deg');
+assert.equal(d.minute.transform[0].rotate,'270deg');
+assert(a.hour.height < a.minute.height,'hour hand shorter than minute');
+assert.equal(a.dot.left+2.5,cx);assert.equal(a.dot.top+2.5,cy);
+console.log('PASS V84.0: 20px badge, true centered clock hand quadrants, no vertical or horizontal ghost animation');

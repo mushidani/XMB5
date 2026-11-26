@@ -1,0 +1,20 @@
+{
+  "version": "V27-geometry-log-hotpath",
+  "files": {
+    "xmb_patch/xmb_extension.js": {
+      "before": "c4c23065a78563e4f3ffbda189d5305d386a96c3bca35ef4f65ad0ed44c2f998",
+      "after": "e9aa5b1840a50e106da5631989a08fb9507e8c86d38a466777bb0715bb0dd560",
+      "backup": "xmb_patch/xmb_extension.js.before_V27_geometry_fix.bak"
+    },
+    "theme/theme.js": {
+      "before": "fbc6a7f553ef1f63a348e2ae378a1d40676d164d0ff0b572eba1186a507db5b3",
+      "after": "2b585bd4383576aefe937ccf7709519a0e9e5888631939062341a4ba1da5517f",
+      "backup": "theme/theme.js.before_V27_geometry_fix.bak"
+    }
+  },
+  "changes": [
+    "static row uses native absolute top",
+    "remove per-repeat log spam"
+  ],
+  "known_limit": "Real held-input speed still limited by native PS5 Repeat callbacks."
+}

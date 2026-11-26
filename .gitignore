@@ -1,0 +1,82 @@
+# build outputs
+src/build/
+src/.cache/
+release/
+*.elf
+*.o
+*.a
+# prebuilt library from OnionHEN, needed by the build
+!src/third_party/keystone/lib/libkeystone.a
+
+# generated from theme/ by scripts/build_zhithemes.sh
+src/source/shellui/include/theme_default_js.hpp
+src/source/shellui/include/theme_web_page.hpp
+src/source/shellui/include/zt_particle_textures.hpp
+theme/theme_factory.js
+
+# Python / editors
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+# never commit
+*.key
+steamgrid.key
+.DS_Store
+Thumbs.db
+
+# signing keys never in the repo
+*.pem
+*.key
+
+# Local development files
+RELEASE_AUDIT.txt
+PUBLIC_BUILD_REVIEW.txt
+*.log
+*.zip
+*.part
+.env
+*.db
+
+# Locally supplied fonts and unreviewed media
+*.ttf
+*.otf
+*.woff
+*.woff2
+*.mp4
+*.mp3
+*.s16le
+
+# Generated embedded media
+src/source/shellui/src/zt_xmb_embedded_media.s
+ps3_assets/embedded_media_manifest.json
+
+# Unreviewed artwork and media directories
+ps3_assets/theme_source/
+xmb_patch/native_assets/
+xmb_patch/badge_src/
+xmbicons/
+xmbwaves/
+
+# Public release exclusions
+PUBLIC_FILES.txt
+/ps3_assets/
+/theme/particles/xmbweb_*
+/theme/particles/xmb_item_game.png
+/default_themes/previews/
+/src/third_party/7zip_sdk/C/Util/7z/_o/
+/update/latest.json
+
+# Historical development documentation
+/README_*
+/START_HERE_*
+/CHANGELOG_V*
+/PATCH_*README*
+/PATCH_TEST_REPORT.txt
+/PS5XMB_HOME_*
+/V*_TEST_REPORT.md
+/V*_PATCH_README.txt
+/V*_DIAGNOSTIC_GUIDE.md
+/TEST_REPORT_V*
+/READ_ME_FIRST.txt

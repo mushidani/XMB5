@@ -1,0 +1,2156 @@
+/* ZhiThemes — PS5 Home theme engine.
+   Copyright (C) 2026 Zhi (ZhiThemes author)
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation; either version 3, or (at your option) any
+later version. See LICENSE and NOTICE.  */
+
+#include "theme_web.hpp"
+#include "zt_paths.hpp"
+#include "homeui_js_inject.hpp"
+
+#if SHELLUI_THEME_WEB == 1
+
+#include "hooked_funcs.hpp"
+#include "zt_brand.hpp"
+#include "zt_log.hpp"
+#include "zt_sgdb.hpp"
+#include "zt_mosaic.hpp"
+#include "zt_storage.hpp"
+#include "zt_xmb_media.hpp"
+#include "zt_xmb_glow.hpp"
+#include "zt_xmb_music.hpp"
+#include "zt_xmb_users.hpp"
+#include "zt_sysicons.hpp"
+#include "zt_update.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <vector>
+#include <strings.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+/*
+ * A small HTTP/1.0 server in ShellUI, one request per connection:
+ *
+ *   GET  /            the editor page (THEME/editor.html, built in)
+ *   GET  /theme.js    current theme script
+ *   POST /theme.js    replace it (body = new script)
+ *   POST /reload      reload HomeUI and the game hub, which evaluate theme.js
+ *                     again
+ *   GET  /log         tail of Logs/zhithemes.log
+ *   GET  /log/find?q= every line of the log with one of the words a|b
+ *                     (+ the session start lines)
+ *   GET  /sysinfo     ZhiThemes version, PS5 model and firmware, debug mode
+ *   GET  /logs        the files of Logs/ (JSON)
+ *   GET  /logs/file?name=   one of them, as a download
+ *   POST /logs/delete?name= delete one (not zhithemes.log)
+ *   POST /debug?on=1&sys=0  debug mode on/off (its lines stay in zhithemes.log)
+ *   GET|POST /injectdelay?s=  seconds the watcher waits after a ShellUI restart (5-120, 15)
+ *   GET  /idle        ms since the Home focus last moved (-1 = unknown)
+ *   POST /quit        take the theme hooks out and stop (a newer ZhiThemes
+ *                     is about to replace this one)
+ *   GET  /version     which build answers (zhithemes / onionhen)
+ *   GET  /games       the Games row sent by the Home (folders tab)
+ *   GET  /icon?p=...  a tile icon (.png under /user/app, /user/appmeta, /system_ex/rnps/apps)
+ *   GET  /layout      the "THEME [app] layout ..." lines (visual editor)
+ *   POST /log/clear   empty zhithemes.log (all sessions)
+ *   POST /report      Report a problem: body = what happened; answer = the
+ *                     report (.txt download)
+ *
+ * The reload is only queued here; ShellUI runs it on its UI thread
+ * (shellui_poll_home_reload), as for the reload after injection.
+ */
+
+namespace {
+
+/* V83.1: restore the proven API port; localhost only, website disabled. */
+constexpr int kPort = 4444;
+/* the theme file is Themes/<active>/theme.json (zt_theme_file()) */
+constexpr const char *kLogPath = ZT_LOGS "/xmb5.log";
+std::atomic<bool> g_web_quit{false}; /* set by POST /quit */
+time_t g_started = time(nullptr); /* when this copy of the module started */
+constexpr size_t kMaxHeader = 16u << 10;
+constexpr size_t kMaxBody = 24u << 20; /* font files can be a few MB */
+constexpr size_t kMaxUpload = (size_t)2u << 30; /* fonts, images, wallpaper videos */
+constexpr size_t kLogTail = 24u << 10;
+
+bool send_all(int fd, const char *data, size_t size) {
+  while (size > 0) {
+    const ssize_t n = send(fd, data, size, 0);
+    if (n <= 0)
+      return false;
+    data += n;
+    size -= (size_t)n;
+  }
+  return true;
+}
+
+/* reads and throws away the rest of a request body, so a refused or
+   failed upload still gets its answer (the browser only shows "Failed to
+   fetch" when we close while it is still sending) */
+void drain(int fd, size_t left) {
+  std::vector<char> junk(64u << 10);
+  while (left > 0) {
+    const ssize_t n = recv(fd, junk.data(), left < junk.size() ? left : junk.size(), 0);
+    if (n <= 0)
+      return;
+    left -= (size_t)n;
+  }
+}
+
+void reply(int fd, int code, const char *status, const char *type,
+           const std::string &body) {
+  char head[256];
+  const int n = snprintf(head, sizeof(head),
+                         "HTTP/1.0 %d %s\r\n"
+                         "Content-Type: %s\r\n"
+                         "Content-Length: %zu\r\n"
+                         "Cache-Control: no-store\r\n"
+                         "Connection: close\r\n\r\n",
+                         code, status, type, body.size());
+  if (n > 0 && send_all(fd, head, (size_t)n))
+    send_all(fd, body.data(), body.size());
+}
+
+/* Whole file (or its last max_tail bytes); empty when missing. */
+std::string read_file(const char *path, size_t max_tail = 0) {
+  std::string out;
+  const int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return out;
+  if (max_tail) {
+    struct stat st;
+    if (fstat(fd, &st) == 0 && (size_t)st.st_size > max_tail)
+      lseek(fd, st.st_size - (off_t)max_tail, SEEK_SET);
+  }
+  char buf[4096];
+  ssize_t n;
+  while ((n = read(fd, buf, sizeof(buf))) > 0 && out.size() < kMaxBody)
+    out.append(buf, (size_t)n);
+  close(fd);
+  return out;
+}
+
+
+/* %XX and '+' of a query value */
+std::string url_decode(const std::string &s) {
+  std::string out;
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '+')
+      out += ' ';
+    else if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) && isxdigit((unsigned char)s[i + 2])) {
+      out += (char)strtol(s.substr(i + 1, 2).c_str(), nullptr, 16);
+      i += 2;
+    } else
+      out += s[i];
+  }
+  return out;
+}
+
+/* one value of a query string (decoded) */
+std::string query_value(const std::string &query, const char *name) {
+  const std::string want = std::string(name) + "=";
+  for (size_t at = 0; at <= query.size();) {
+    size_t amp = query.find('&', at);
+    if (amp == std::string::npos)
+      amp = query.size();
+    if (query.compare(at, want.size(), want) == 0)
+      return url_decode(query.substr(at + want.size(), amp - at - want.size()));
+    at = amp + 1;
+  }
+  return "";
+}
+
+/* a path segment for the SteamGridDB API */
+std::string url_encode(const std::string &s) {
+  static const char *hex = "0123456789ABCDEF";
+  std::string out;
+  for (unsigned char c : s)
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~')
+      out += (char)c;
+    else {
+      out += '%';
+      out += hex[c >> 4];
+      out += hex[c & 15];
+    }
+  return out;
+}
+
+size_t content_length(const std::string &head) {
+  for (size_t at = 0; (at = head.find("\r\n", at)) != std::string::npos;) {
+    at += 2;
+    if (strncasecmp(head.c_str() + at, "Content-Length:", 15) == 0)
+      return strtoul(head.c_str() + at + 15, nullptr, 10);
+  }
+  return 0;
+}
+
+/* GET /asset sends its file from a thread (see there) */
+bool g_fd_taken = false; /* handle() gave fd to a thread: not closed after */
+pthread_mutex_t g_asset_lock = PTHREAD_MUTEX_INITIALIZER;
+int g_asset_clients = 0;
+struct AssetJob {
+  int fd, in;
+  std::string head;
+};
+void asset_send(int fd, AssetJob &j) {
+  bool sent = !j.head.empty() && send_all(fd, j.head.data(), j.head.size());
+  std::vector<char> chunk(256u << 10);
+  for (ssize_t got; sent && !g_web_quit && (got = read(j.in, chunk.data(), chunk.size())) > 0;)
+    sent = send_all(fd, chunk.data(), (size_t)got);
+  close(j.in);
+}
+void *asset_client(void *arg) {
+  AssetJob *j = (AssetJob *)arg;
+  asset_send(j->fd, *j);
+  close(j->fd);
+  delete j;
+  pthread_mutex_lock(&g_asset_lock);
+  --g_asset_clients;
+  pthread_mutex_unlock(&g_asset_lock);
+  return nullptr;
+}
+
+/* V38: POST /xmb-art decodes a (possibly 4K) picture: done on a thread of its own so the XMB sounds, which share this server thread, never wait for it */
+struct ArtJob {
+  int fd;
+  std::string path;
+  bool icon; /* V41: /xmb-icon (small filtered copies of a game icon) instead of /xmb-art */
+};
+int g_art_clients = 0;
+void *art_client(void *arg) {
+  ArtJob *j = (ArtJob *)arg;
+  if (j->icon) {
+    std::string s96, s180;
+    if (zt_xmb_icon_levels(j->path, s96, s180)) reply(j->fd, 200, "OK", "application/json", "{\"s\":\"" + s96 + "\",\"b\":\"" + s180 + "\"}");
+    else reply(j->fd, 404, "Not Found", "text/plain", "no icon");
+  } else {
+    const int r = zt_xmb_art_check(j->path);
+    reply(j->fd, 200, "OK", "text/plain", r == 0 ? "ok" : r == 1 ? "blank" : "missing");
+  }
+  close(j->fd);
+  delete j;
+  pthread_mutex_lock(&g_asset_lock);
+  --g_art_clients;
+  pthread_mutex_unlock(&g_asset_lock);
+  return nullptr;
+}
+
+/* V63: POST /xmb-appinfo (install dates / a title's size): a size walks the title's folders, so it runs on a thread of its own */
+struct InfoJob {
+  int fd;
+  std::string ids;
+  bool size;
+};
+int g_info_clients = 0;
+void *info_client(void *arg) {
+  InfoJob *j = (InfoJob *)arg;
+  reply(j->fd, 200, "OK", "application/json", zt_xmb_appinfo_json(j->ids, j->size));
+  close(j->fd);
+  delete j;
+  pthread_mutex_lock(&g_asset_lock);
+  --g_info_clients;
+  pthread_mutex_unlock(&g_asset_lock);
+  return nullptr;
+}
+
+/* GET /themes/pack: the .ztheme made while it is sent (see there) */
+struct PackJob {
+  int fd;
+  ZtPack pack;
+};
+void pack_send(int fd, const ZtPack &pack) {
+  char head[512];
+  const int n = snprintf(head, sizeof(head),
+                         "HTTP/1.0 200 OK\r\n"
+                         "Content-Type: application/zip\r\n"
+                         "Content-Disposition: attachment; filename=\"%s.ztheme\"\r\n"
+                         "Content-Length: %llu\r\n"
+                         "X-ZT-Missing: %d\r\n"
+                         "Cache-Control: no-store\r\n"
+                         "Connection: close\r\n\r\n",
+                         pack.theme.c_str(), (unsigned long long)pack.size, pack.missing);
+  if (n <= 0 || !send_all(fd, head, (size_t)n))
+    return;
+  const bool ok = zt_theme_pack_write(pack, [fd](const char *p, size_t size) {
+    return !g_web_quit && send_all(fd, p, size);
+  });
+  zt_logl(ok ? 'A' : 'W', "web: Download %s.ztheme (%zu files, %llu bytes) %s", pack.theme.c_str(),
+          pack.files.size(), (unsigned long long)pack.size, ok ? "sent" : "cut off");
+}
+void *pack_client(void *arg) {
+  PackJob *j = (PackJob *)arg;
+  pack_send(j->fd, j->pack);
+  close(j->fd);
+  delete j;
+  pthread_mutex_lock(&g_asset_lock);
+  --g_asset_clients;
+  pthread_mutex_unlock(&g_asset_lock);
+  return nullptr;
+}
+
+/* GET /sgdb/img: the CDN picture handed on piece by piece (see there) */
+struct SgdbImgJob {
+  int fd;
+  std::string url;
+  const char *mime;
+  const char *who; /* the site, in the error text */
+  size_t max;
+  bool preview = false;
+  bool priority = false;
+};
+
+bool g_sgdb_download_active = false; /* protected by g_asset_lock */
+
+void sgdb_img_send(int fd, const std::string &url, const char *mime, const char *who = "SteamGridDB",
+                   size_t max = 400u << 20, bool preview = false, bool priority = false) {
+  bool head_sent = false, client_ok = true;
+  long http = 0, bad = 0;
+  std::string err;
+  const bool ok = zt_sgdb_stream(
+      url, max,
+      [&](const char *p, size_t n, long code, long long total) -> bool {
+        if (g_web_quit)
+          return false;
+        if (!head_sent) {
+          if (code != 200) {
+            bad = code;
+            return false;
+          }
+          char head[320];
+          /* the CDN pictures never change: the editor's browser keeps them */
+          const int hn = total >= 0
+                             ? snprintf(head, sizeof(head),
+                                        "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %lld\r\n"
+                                        "Cache-Control: private, max-age=86400\r\nConnection: close\r\n\r\n",
+                                        mime, total)
+                             : snprintf(head, sizeof(head),
+                                        "HTTP/1.0 200 OK\r\nContent-Type: %s\r\n"
+                                        "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                                        mime);
+          head_sent = true;
+          if (hn <= 0 || !send_all(fd, head, (size_t)hn)) {
+            client_ok = false;
+            return false;
+          }
+        }
+        if (!send_all(fd, p, n)) {
+          client_ok = false;
+          return false;
+        }
+        return true;
+      },
+      http, err, preview, priority, [] { return g_web_quit.load(); });
+  if (!head_sent) {
+    const std::string why = bad ? "HTTP " + std::to_string(bad) : err.empty() ? std::to_string(http) : err;
+    reply(fd, 502, "Bad Gateway", "text/plain", std::string(who) + ": " + why);
+  } else if (!ok && client_ok) {
+    zt_log("sgdb: %s file cut off: %s", who, err.c_str());
+  }
+}
+void *sgdb_img_client(void *arg) {
+  SgdbImgJob *j = (SgdbImgJob *)arg;
+  sgdb_img_send(j->fd, j->url, j->mime, j->who, j->max, j->preview, j->priority);
+  close(j->fd);
+  pthread_mutex_lock(&g_asset_lock);
+  if (j->priority)
+    g_sgdb_download_active = false;
+  --g_asset_clients;
+  pthread_mutex_unlock(&g_asset_lock);
+  delete j;
+  return nullptr;
+}
+
+void video_stop(); /* below */
+
+void handle(int fd) {
+  std::string req;
+  char buf[4096];
+  size_t header_end = std::string::npos;
+  while (header_end == std::string::npos && req.size() < kMaxHeader) {
+    const ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n <= 0)
+      return;
+    req.append(buf, (size_t)n);
+    header_end = req.find("\r\n\r\n");
+  }
+  if (header_end == std::string::npos)
+    return reply(fd, 431, "Header Too Large", "text/plain", "header too large");
+
+  const std::string head = req.substr(0, header_end);
+  std::string body = req.substr(header_end + 4);
+  const size_t sp1 = head.find(' ');
+  const size_t sp2 = head.find(' ', sp1 + 1);
+  if (sp1 == std::string::npos || sp2 == std::string::npos)
+    return reply(fd, 400, "Bad Request", "text/plain", "bad request");
+  const std::string method = head.substr(0, sp1);
+  std::string path = head.substr(sp1 + 1, sp2 - sp1 - 1);
+  const size_t qmark = path.find('?');
+  const std::string query = qmark == std::string::npos ? "" : path.substr(qmark + 1);
+  path = path.substr(0, qmark);
+
+  /* V83: expose only the game-console XMB endpoints and lifecycle probes.
+     All legacy web-editor routes remain unavailable, even on localhost. */
+  const bool xmb_api = path.rfind("/xmb", 0) == 0;
+  const bool lifecycle = (path == "/version" || path == "/quit" || path == "/idle");
+  if (!xmb_api && !lifecycle)
+    return reply(fd, 404, "Not Found", "text/plain",
+                 "XMB5 internal API only (no website)");
+
+  const size_t want = content_length(head);
+  /* POST /install?name=<file name>[&replace=<theme>]: the editor's Install. The .ztheme (or
+     an older theme file) is written to Install/.editor-upload.part while it
+     arrives, installed like the Home menu does (same checks, older files
+     translated) and deleted; the theme is used. {"theme":"<name>"} */
+  if (method == "POST" && path == "/install") {
+    const std::string fname = query_value(query, "name");
+    if (want == 0 || want > ((uint64_t)4u << 30)) {
+      if (want <= kMaxUpload)
+        drain(fd, want > body.size() ? want - body.size() : 0);
+      return reply(fd, 400, "Bad Request", "text/plain", want == 0 ? "empty file" : "file too big (4 GB at most)");
+    }
+    zt_mkdirs(ZT_DIR "/Install");
+    const std::string temp = ZT_DIR "/Install/.editor-upload.part";
+    const int lf = open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    bool ok = lf >= 0;
+    size_t got = 0;
+    auto put = [&](const char *data, size_t size) {
+      for (size_t off = 0; ok && off < size;) {
+        const ssize_t n = write(lf, data + off, size - off);
+        ok = n > 0;
+        off += ok ? (size_t)n : 0;
+      }
+      got += size;
+    };
+    put(body.data(), body.size() < want ? body.size() : want);
+    std::vector<char> chunk(256u << 10);
+    while (ok && got < want) {
+      const size_t room = want - got < chunk.size() ? want - got : chunk.size();
+      const ssize_t n = recv(fd, chunk.data(), room, 0);
+      if (n <= 0)
+        break;
+      put(chunk.data(), (size_t)n);
+    }
+    if (!ok && got < want)
+      drain(fd, want - got);
+    ok = ok && got == want;
+    if (lf >= 0) {
+      fsync(lf);
+      close(lf);
+    }
+    if (!ok) {
+      unlink(temp.c_str());
+      zt_logl('W', "web: Install %s: upload cut (%zu of %zu bytes)", fname.c_str(), got, want);
+      return reply(fd, 500, "Error", "text/plain", "the file did not arrive whole");
+    }
+    std::string theme;
+    /* &replace=<theme>: that theme is replaced (else a name already there gets -2) */
+    const std::string err = zt_install_file(temp, fname.empty() ? std::string("theme.ztheme") : fname, &theme,
+                                            query_value(query, "replace"));
+    unlink(temp.c_str());
+    if (!err.empty()) {
+      zt_logl('W', "web: Install %s: %s", fname.c_str(), err.c_str());
+      return reply(fd, 400, "Bad Request", "text/plain", err);
+    }
+    shellui_request_hub_reload();
+    shellui_request_home_reload();
+    return reply(fd, 200, "OK", "application/json", "{\"theme\":" + zt_json_quote(theme) + "}");
+  }
+  /* POST /font?name=my.otf -> <dir>/fonts/, POST /background?name=x.png ->
+     <dir>/backgrounds/ (the theme's own wallpaper; also .mp4 videos of a
+     few hundred MB): written to the file while it arrives, never whole in
+     memory. POST /customtile?name=x.png -> <dir>/customtile/ (folder
+     icons uploaded in the editor; later the SteamGridDB covers) */
+  /* POST /background?kind=wallpapers|icons|folders&name= (zt_folder_*
+     from the editor -> cache/mosaics) */
+  if (method == "POST" && (path == "/font" || path == "/background" || path == "/customtile" || path == "/custombg")) {
+    const std::string kind = query_value(query, "kind");
+    std::string sub = path == "/font" ? "fonts" : path == "/customtile" ? "customtile"
+                    : path == "/custombg" ? "custombg"
+                    : kind == "icons" ? "icons" : kind == "folders" ? "folders"
+                    : kind == "avatars" ? "avatars" : "wallpapers";
+    std::string name = query_value(query, "name");
+    if (path == "/background" && name.rfind("zt_folder_", 0) == 0)
+      sub = "cache/mosaics";
+    /* V50: POST /background?kind=xmbwaves&name=XMB5_Wave_<01-12>_<Day|Night>.mp4 -> ZT_DIR/xmbwaves (the XMB's month waves; kept
+       outside the themes so switching theme keeps them) */
+    const bool xmbwave = path == "/background" && kind == "xmbwaves";
+    if (xmbwave && (name.rfind("XMB5_Wave_", 0) != 0 || name.size() < 14 || name.compare(name.size() - 4, 4, ".mp4") != 0))
+      name.clear();
+    /* V73: POST /background?kind=xmbicons&name=<icon>.png -> ZT_DIR/xmbicons (icons for the XMB's custom columns, at most 4 MB) */
+    const bool xmbicon = path == "/background" && kind == "xmbicons";
+    if (xmbicon && (name.size() < 5 || name.compare(name.size() - 4, 4, ".png") != 0 || want > (4u << 20)))
+      name.clear();
+    bool ok_name = !name.empty() && name.size() < 80 && name[0] != '.';
+    for (char c : name)
+      if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_'))
+        ok_name = false;
+    /* wallpapers, icons and fonts go to a theme's folder (&theme=
+       when a pack is installed as another theme; else the active one);
+       the rest to Assets/ */
+    const bool theme_kind = !xmbwave && !xmbicon && (sub == "fonts" || sub == "icons" || sub == "wallpapers");
+    const std::string theme = query_value(query, "theme");
+    if (!theme.empty() && !zt_theme_name_ok(theme))
+      ok_name = false;
+    if (!ok_name || want == 0 || want > kMaxUpload) {
+      if (want <= kMaxUpload)
+        drain(fd, want > body.size() ? want - body.size() : 0);
+      return reply(fd, 400, "Bad Request", "text/plain",
+                   name.size() >= 80 ? "file name too long (79 letters at most)"
+                   : want == 0 ? "empty file" : want > kMaxUpload ? "file too big"
+                   : "invalid file name (only A-Z a-z 0-9 . _ -)");
+    }
+    const std::string folder = xmbwave ? std::string(ZT_DIR "/xmbwaves") : xmbicon ? std::string(ZT_DIR "/xmbicons")
+                             : theme_kind ? zt_theme_dir_of(theme, sub.c_str()) : std::string(ZT_ASSETS "/") + sub;
+    zt_mkdirs(folder);
+    const std::string dest = folder + "/" + name;
+    const std::string temp = dest + ".part";
+    const int lf = open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    bool ok = lf >= 0;
+    size_t got = 0;
+    auto put = [&](const char *data, size_t size) {
+      for (size_t off = 0; ok && off < size;) {
+        const ssize_t n = write(lf, data + off, size - off);
+        ok = n > 0;
+        off += ok ? (size_t)n : 0;
+      }
+      got += size;
+    };
+    put(body.data(), body.size() < want ? body.size() : want);
+    std::vector<char> chunk(256u << 10);
+    while (ok && got < want) {
+      const size_t room = want - got < chunk.size() ? want - got : chunk.size();
+      const ssize_t n = recv(fd, chunk.data(), room, 0);
+      if (n <= 0)
+        break;
+      put(chunk.data(), (size_t)n);
+    }
+    if (!ok && got < want) /* write error: still answer */
+      drain(fd, want - got);
+    ok = ok && got == want;
+    if (lf >= 0) {
+      fsync(lf);
+      close(lf);
+    }
+    if (ok && rename(temp.c_str(), dest.c_str()) != 0)
+      ok = false;
+    if (!ok)
+      unlink(temp.c_str());
+    zt_logl('A', "web: upload %s %s (%zu of %zu bytes) %s", sub.c_str(), dest.c_str(), got, want,
+                   ok ? "saved" : "FAILED");
+    if (ok && theme_kind)
+      zt_dedupe(dest);
+    return reply(fd, ok ? 200 : 500, ok ? "OK" : "Error", "text/plain",
+                 ok ? "saved" : "write error");
+  }
+  if (want > kMaxBody)
+    return reply(fd, 413, "Too Large", "text/plain", "body too large");
+  while (body.size() < want) {
+    const ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n <= 0)
+      break;
+    body.append(buf, (size_t)n);
+  }
+  body.resize(body.size() < want ? body.size() : want);
+
+  /* One-shot XMB sound, local requests only. The actual PCM is decoded at
+     build time and embedded into this very same ELF. Never use the video
+     wallpaper decoder to play tiny navigation sounds. */
+  if (path == "/xmb-sfx" && method == "POST") {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    const std::string which=query_value(query,"kind");
+    if (which=="warm" || which=="sleep") {
+      const bool ok=zt_xmb_sfx_warm(which=="warm");
+      return reply(fd,ok?202:503,ok?"Accepted":"Unavailable","text/plain",ok?"ok":"audio backend unavailable");
+    }
+    const int sfx_id = which=="cursor" ? 1 : which=="category" ? 2 : which=="decide" ? 3 : which=="cancel" ? 4 : which=="ok" ? 5 : which=="ng" ? 6 : 0;
+    if (!sfx_id)
+      return reply(fd,400,"Bad Request","text/plain","use kind=cursor, category, decide, cancel, ok, ng, warm or sleep");
+    const bool ok=zt_xmb_sfx_play(sfx_id);
+    return reply(fd,ok?202:503,ok?"Accepted":"Unavailable","text/plain",ok?"queued":"audio backend unavailable");
+  }
+  /* V43: the console's users for the XMB's Users category (local requests only) */
+  if (path == "/xmb-users" && (method == "POST" || method == "GET")) {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    return reply(fd,200,"OK","application/json",zt_xmb_users_json());
+  }
+  /* V60: real PS5 values for System Settings (local requests only) */
+  if (path == "/xmb-sys" && (method == "POST" || method == "GET")) {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    return reply(fd,200,"OK","application/json",zt_xmb_sys_json());
+  }
+  /* V73: the XMB's custom columns (as the folders below) and the running title / Close Application (local requests only) */
+  if ((path == "/xmb-columns" || path == "/xmb-order" || path == "/xmb-cats") && (method == "POST" || method == "GET")) {   /* V74: + the custom order; V78: + the names / icons of the XMB's own columns */
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    const char *which = path == "/xmb-order" ? "order" : path == "/xmb-cats" ? "cats" : "columns";
+    if (method == "GET") {
+      const std::string result = zt_xmb_list_get(which);
+      static std::atomic<unsigned> recovery_logged{0};
+      const unsigned bit = path == "/xmb-order" ? 1u : path == "/xmb-cats" ? 2u : 4u;
+      if (!(recovery_logged.fetch_or(bit) & bit)) {
+        const std::string file = std::string(ZT_DIR "/PS5XMB_") + which + ".json";
+        struct stat st = {};
+        const bool exists = stat(file.c_str(), &st) == 0;
+        zt_log("XMB5 recovery: GET %s from %s, exists=%d file_bytes=%lld response_bytes=%zu",
+               path.c_str(), file.c_str(), exists ? 1 : 0,
+               exists ? static_cast<long long>(st.st_size) : -1LL, result.size());
+      }
+      return reply(fd,200,"OK","application/json",result);
+    }
+    const bool ok = zt_xmb_list_set(which, body);
+    return reply(fd,ok?200:400,ok?"OK":"Bad Request","text/plain",ok?"saved":"bad column list");
+  }
+  if (path == "/xmb-app" && method == "POST") {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    const std::string op = query_value(query,"op");
+    if (op == "close") {
+      const bool ok = zt_xmb_close_app(query_value(query,"id"));
+      return reply(fd,ok?200:409,ok?"OK":"Conflict","text/plain",ok?"closed":"not running");
+    }
+    return reply(fd,200,"OK","application/json",zt_xmb_running_json());
+  }
+  /* V68: the XMB's game folders (local requests only): GET -> the JSON list, POST body = the whole new list */
+  if (path == "/xmb-folders" && (method == "POST" || method == "GET")) {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    if (method == "GET") return reply(fd,200,"OK","application/json",zt_xmb_folders_get());
+    const bool ok = zt_xmb_folders_set(body);
+    return reply(fd,ok?200:400,ok?"OK":"Bad Request","text/plain",ok?"saved":"bad folder list");
+  }
+  /* V63: install dates (?ids=A,B,..) or one title's size (?ids=A&size=1) for the XMB's Game category (local requests only) */
+  if (path == "/xmb-appinfo" && (method == "POST" || method == "GET")) {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    std::string ids = query_value(query,"ids");
+    if (ids.empty()) ids = body;
+    auto *job = new InfoJob{fd, ids, query_value(query,"size") == "1"};
+    pthread_mutex_lock(&g_asset_lock);
+    const bool room = g_info_clients < 2;
+    if (room) ++g_info_clients;
+    pthread_mutex_unlock(&g_asset_lock);
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 512u << 10);
+    const bool started = room && pthread_create(&t, &attr, info_client, job) == 0;
+    pthread_attr_destroy(&attr);
+    if (started) {
+      pthread_detach(t);
+      g_fd_taken = true;
+      return;
+    }
+    if (room) {
+      pthread_mutex_lock(&g_asset_lock);
+      --g_info_clients;
+      pthread_mutex_unlock(&g_asset_lock);
+    }
+    delete job;
+    return reply(fd,503,"Busy","text/plain","busy");
+  }
+  /* V51: the XMB's settings (local requests only): GET -> the file, POST ?key=&value= -> saved */
+  if (path == "/xmb-prefs" && (method == "POST" || method == "GET")) {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    if (method == "GET" || query_value(query,"key").empty()) return reply(fd,200,"OK","text/plain",zt_xmb_prefs_get());
+    const bool ok = zt_xmb_prefs_set(query_value(query,"key"), query_value(query,"value"));
+    return reply(fd,ok?200:400,ok?"OK":"Bad Request","text/plain",ok?"saved":"bad key or value");
+  }
+  /* V48: the Photo category's Photos (the console's screenshots), local requests only */
+  if (path == "/xmb-photos" && (method == "POST" || method == "GET")) {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    return reply(fd,200,"OK","application/json",zt_xmb_photos_json());
+  }
+  if (path == "/xmb-videos" && (method == "POST" || method == "GET")) {   /* V78: the Gallery's Video list */
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    return reply(fd,200,"OK","application/json",zt_xmb_videos_json());
+  }
+  /* V40: a game's own music, played by the XMB (local requests only). op=play&paths=a|b&vol=60, op=stop */
+  if (path == "/xmb-music" && method == "POST") {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    const std::string op=query_value(query,"op");
+    if (op=="stop") { zt_xmb_music_stop(); return reply(fd,202,"Accepted","text/plain","stopping"); }
+    if (op=="status") return reply(fd,200,"OK","text/plain",zt_xmb_music_status());
+    if (op=="note") { zt_xmb_note("js: " + query_value(query,"text").substr(0, 900)); return reply(fd,200,"OK","text/plain","noted"); }
+    if (op!="play") return reply(fd,400,"Bad Request","text/plain","use op=play or op=stop");
+    const std::string vol=query_value(query,"vol");
+    const int r=zt_xmb_music_play(query_value(query,"paths"),vol.empty()?60:atoi(vol.c_str()));
+    if (r==202) zt_xmb_sfx_kick();
+    return reply(fd,r,r==202?"Accepted":r==404?"Not Found":r==415?"Unsupported":r==409?"Conflict":"Unavailable","text/plain",
+                 r==202?"playing":r==404?"no music file":r==415?"not atrac9":r==409?"a game is running":"decoder unavailable");
+  }
+  /* V38: XMB helpers for HomeUI (local requests only): text glow picture, background picture check */
+  if ((path == "/xmb-glow" || path == "/xmb-art" || path == "/xmb-icon") && (method == "POST" || method == "GET")) {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    if (path == "/xmb-art" || path == "/xmb-icon") {
+      auto *job = new ArtJob{fd, query_value(query,"path"), path == "/xmb-icon"};
+      pthread_mutex_lock(&g_asset_lock);
+      const bool room = g_art_clients < 2;
+      if (room) ++g_art_clients;
+      pthread_mutex_unlock(&g_asset_lock);
+      pthread_t t;
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, 512u << 10);
+      const bool started = room && pthread_create(&t, &attr, art_client, job) == 0;
+      pthread_attr_destroy(&attr);
+      if (started) {
+        pthread_detach(t);
+        g_fd_taken = true;
+        return;
+      }
+      if (room) {
+        pthread_mutex_lock(&g_asset_lock);
+        --g_art_clients;
+        pthread_mutex_unlock(&g_asset_lock);
+      }
+      delete job;
+      if (path == "/xmb-icon") return reply(fd,503,"Busy","text/plain","busy");
+      return reply(fd,200,"OK","text/plain","ok");   /* busy: the picture is shown (fail open) */
+    }
+    ZtXmbGlow g;
+    const std::string text=query_value(query,"text");
+    if (!zt_xmb_glow_make(text,atoi(query_value(query,"px").c_str()),atoi(query_value(query,"lh").c_str()),g))
+      return reply(fd,503,"Unavailable","text/plain","glow unavailable");
+    char js[640];
+    std::string esc;
+    for (char c : g.path) { if (c=='"' || c=='\\') esc+='\\'; esc+=c; }
+    snprintf(js,sizeof(js),"{\"p\":\"%s\",\"w\":%d,\"h\":%d,\"tw\":%d,\"pad\":%d}",esc.c_str(),g.w,g.h,g.tw,g.pad);
+    return reply(fd,200,"OK","application/json",js);
+  }
+  if (method == "GET" && (path == "/" || path == "/index.html"))
+    return reply(fd, 404, "Not Found", "text/plain", "XMB5 local API only (no editor)");
+  if (method == "GET" && path == "/theme.js")
+    return reply(fd, 200, "OK", "text/plain; charset=utf-8",
+                 theme_script());
+  if (method == "POST" && path == "/theme.js") {
+    if (body.size() != want || body.empty())
+      return reply(fd, 400, "Bad Request", "text/plain", "incomplete body");
+    /* ?name=<theme> writes that theme (a pack installed as a new
+       theme); without it the active one */
+    const std::string name = query_value(query, "name");
+    if (!name.empty() && !zt_theme_name_ok(name))
+      return reply(fd, 400, "Bad Request", "text/plain", "invalid theme name");
+    const std::string file = zt_theme_file(name);
+    /* &personal=1 (an installed pack): the folders and custom tile choices
+       of the theme in use stay */
+    const std::string before = query_value(query, "personal") == "1" ? zt_theme_read() : std::string();
+    /* the values as they were, for the "A field ..." lines */
+    const std::string old_text = zt_theme_read_path(file);
+    /* only the values of the text are kept (theme.json) */
+    if (body.find("var THEME") == std::string::npos)
+      return reply(fd, 400, "Bad Request", "text/plain", "no THEME block in this text");
+    if (!zt_theme_write_path(file, body))
+      return reply(fd, 500, "Error", "text/plain", "cannot write " + file);
+    if (!before.empty())
+      zt_carry_personal(before, file);
+    static int saves = 0;
+    const std::string who = "editor save " + std::to_string(++saves);
+    const int changed = old_text.empty() ? -1
+                                         : zt_theme_log_changes(old_text, zt_theme_read_path(file), who.c_str());
+    zt_logl('A', "web: %s saved (%zu bytes, %s, %s)", file.c_str(), body.size(),
+            changed < 0 ? "new file" : (std::to_string(changed) + " fields changed").c_str(),
+            who.c_str());
+    /* Apply in the editor turns ZhiThemes back on (PS5 default off) */
+    if (name.empty() || name == zt_theme_name())
+      zt_stock_set(false);
+    return reply(fd, 200, "OK", "text/plain", "saved");
+  }
+  /* themes:
+       GET  /themes                       {"active":"X","themes":[{name,files,bytes,modified}]}
+       POST /themes/use?name=             switch (the Home and the hub reload)
+       POST /themes/new?name=&from=       new theme: a copy of from (its files
+                                          linked), or the factory theme
+       POST /themes/rename?name=&to=
+       POST /themes/delete?name=          with its folder (not the active one)
+       POST /themes/clear?name=           empty its folder (a pack replaces it) */
+  if (method == "GET" && path == "/themes")
+    return reply(fd, 200, "OK", "application/json", zt_themes_json());
+  /* only the name of the theme in use: the editor asks every few seconds
+     to see a theme switched from the PS5 (Home menu, USB install) */
+  if (method == "GET" && path == "/themes/active")
+    return reply(fd, 200, "OK", "text/plain; charset=utf-8", zt_theme_name());
+  /* GET /themes/pack?name= : the theme as a .ztheme (the editor's
+     Download), made while it is sent, from a thread of its own (a pack
+     with a video takes a while; the editor must not wait behind it) */
+  if (method == "GET" && path == "/themes/pack") {
+    auto *job = new PackJob{fd, ZtPack()};
+    const std::string err = zt_theme_pack_plan(query_value(query, "name"), &job->pack);
+    if (!err.empty()) {
+      delete job;
+      zt_logl('W', "web: Download %s: %s", query_value(query, "name").c_str(), err.c_str());
+      return reply(fd, 400, "Bad Request", "text/plain", err);
+    }
+    /* &check=1: only what would go in */
+    if (query_value(query, "check") == "1") {
+      const std::string out = "{\"files\":" + std::to_string(job->pack.files.size()) +
+                              ",\"size\":" + std::to_string((unsigned long long)job->pack.size) +
+                              ",\"missing\":" + std::to_string(job->pack.missing) + "}";
+      delete job;
+      return reply(fd, 200, "OK", "application/json", out);
+    }
+    pthread_t t;
+    pthread_mutex_lock(&g_asset_lock);
+    const bool room = g_asset_clients < 4;
+    if (room)
+      ++g_asset_clients;
+    pthread_mutex_unlock(&g_asset_lock);
+    if (room && pthread_create(&t, nullptr, pack_client, job) == 0) {
+      pthread_detach(t);
+      g_fd_taken = true;
+      return;
+    }
+    if (room) {
+      pthread_mutex_lock(&g_asset_lock);
+      --g_asset_clients;
+      pthread_mutex_unlock(&g_asset_lock);
+    }
+    pack_send(fd, job->pack);
+    delete job;
+    return;
+  }
+  /* GET /themes/text?name= : that theme's values as THEME text (the editor
+     counts the files it uses) */
+  if (method == "GET" && path == "/themes/text") {
+    const std::string name = query_value(query, "name");
+    if (!zt_theme_name_ok(name))
+      return reply(fd, 400, "Bad Request", "text/plain", "invalid theme name");
+    const std::string text = zt_theme_read(name);
+    if (text.empty())
+      return reply(fd, 404, "Not Found", "text/plain", "no such theme");
+    return reply(fd, 200, "OK", "text/plain; charset=utf-8", text);
+  }
+  /* POST /themes/info?name= : body = author on the first line, then the
+     description (theme.json's "author" / "description") */
+  if (method == "POST" && path == "/themes/info") {
+    const std::string name = query_value(query, "name");
+    if (!zt_theme_name_ok(name) || zt_theme_read(name).empty())
+      return reply(fd, 400, "Bad Request", "text/plain", "no such theme");
+    ZtThemeInfo info = zt_theme_info(name);
+    const size_t nl = body.find('\n');
+    info.author = body.substr(0, nl == std::string::npos ? body.size() : nl);
+    info.description = nl == std::string::npos ? std::string() : body.substr(nl + 1);
+    while (!info.author.empty() && (info.author.back() == '\r' || info.author.back() == ' '))
+      info.author.pop_back();
+    if (info.author.size() > 80 || info.description.size() > 1000)
+      return reply(fd, 400, "Bad Request", "text/plain", "author (80) or description (1000) too long");
+    if (!zt_theme_info_set(name, info))
+      return reply(fd, 500, "Error", "text/plain", "cannot write the theme");
+    zt_logl('A', "web: theme %s: author / description saved", name.c_str());
+    return reply(fd, 200, "OK", "text/plain", "saved");
+  }
+  if (method == "POST" && path.rfind("/themes/", 0) == 0) {
+    const std::string name = query_value(query, "name");
+    std::string err;
+    bool reload = false;
+    if (path == "/themes/use") {
+      err = zt_theme_use(name);
+      reload = err.empty();
+      if (reload)
+        zt_stock_set(false);
+    } else if (path == "/themes/new")
+      err = zt_theme_new(name, query_value(query, "from"));
+    else if (path == "/themes/rename") {
+      const bool active = name == zt_theme_name();
+      err = zt_theme_rename(name, query_value(query, "to"));
+      reload = err.empty() && active; /* the theme's folder moved */
+    } else if (path == "/themes/delete")
+      err = zt_theme_delete(name);
+    else if (path == "/themes/clear")
+      err = zt_theme_clear(name);
+    else if (path == "/themes/clean") { /* body = the unused files, one per line */
+      int removed = 0;
+      err = zt_theme_clean(name, body, &removed);
+    }
+    else
+      return reply(fd, 404, "Not Found", "text/plain", "not found");
+    if (!err.empty()) {
+      zt_logl('W', "web: %s %s: %s", path.c_str(), name.c_str(), err.c_str());
+      return reply(fd, 400, "Bad Request", "text/plain", err);
+    }
+    zt_logl('A', "theme %s %s%s%s (editor)", path.c_str() + 8, name.c_str(),
+            path == "/themes/rename" ? " -> " : path == "/themes/new" ? " from " : "",
+            path == "/themes/rename" ? query_value(query, "to").c_str()
+            : path == "/themes/new"  ? query_value(query, "from").c_str()
+                                     : "");
+    if (reload) {
+      shellui_request_hub_reload();
+      shellui_request_home_reload();
+    }
+    return reply(fd, 200, "OK", "application/json", zt_themes_json());
+  }
+  if (method == "POST" && path == "/reload") {
+    zt_logl('A', "web: HomeUI + game hub reload requested (editor)");
+    shellui_request_hub_reload();
+    shellui_request_home_reload();
+    return reply(fd, 200, "OK", "text/plain", "reload queued");
+  }
+  if (method == "GET" && path == "/log")
+    return reply(fd, 200, "OK", "text/plain; charset=utf-8",
+                 read_file(kLogPath, kLogTail));
+  if (method == "GET" && path == "/log/find") {
+    /* every line of the whole log that has one of the words of q
+       (q=rename|folder, '+' or %20 = space): the tail of /log is only 24 KB */
+    std::string q = query.rfind("q=", 0) == 0 ? query.substr(2) : "";
+    std::string dec;
+    for (size_t i = 0; i < q.size(); ++i) {
+      if (q[i] == '+') dec += ' ';
+      else if (q[i] == '%' && i + 2 < q.size()) {
+        dec += (char)strtol(q.substr(i + 1, 2).c_str(), nullptr, 16);
+        i += 2;
+      } else dec += q[i];
+    }
+    std::vector<std::string> words;
+    for (size_t at = 0; at <= dec.size();) {
+      size_t bar = dec.find('|', at);
+      if (bar == std::string::npos) bar = dec.size();
+      if (bar > at) words.push_back(dec.substr(at, bar - at));
+      at = bar + 1;
+    }
+    /* read in pieces (the log can be 16 MB): the session start lines are
+       always kept, so each hit shows which session it is in; the newest
+       hits win when there are too many */
+    constexpr size_t kMaxFind = 2u << 20;
+    std::string out, rest;
+    const int lf = open(kLogPath, O_RDONLY);
+    std::vector<char> buf(65536);
+    for (ssize_t n; lf >= 0 && !words.empty() && (n = read(lf, buf.data(), buf.size())) > 0;) {
+      rest.append(buf.data(), (size_t)n);
+      size_t at = 0;
+      for (size_t end; (end = rest.find('\n', at)) != std::string::npos; at = end + 1) {
+        /* (no memmem in the PS5's libc) */
+        const char *line = rest.data() + at, *line_end = rest.data() + end;
+        auto has = [&](const char *w, size_t n) {
+          return std::search(line, line_end, w, w + n) != line_end;
+        };
+        bool keep = end > at && has("==== session start", 18);
+        for (size_t w = 0; !keep && w < words.size(); ++w)
+          keep = has(words[w].data(), words[w].size());
+        if (keep)
+          out.append(line, end - at + 1);
+      }
+      rest.erase(0, at);
+      if (out.size() > kMaxFind)
+        out.erase(0, out.find('\n', out.size() - kMaxFind / 2) + 1);
+    }
+    if (lf >= 0)
+      close(lf);
+    return reply(fd, 200, "OK", "text/plain; charset=utf-8", out);
+  }
+  if (method == "GET" && path == "/layout") {
+    /* where theme.js measured each element; only the newest lines matter */
+    const std::string log = read_file(kLogPath, 2u << 20);
+    std::string out;
+    for (size_t at = 0; at < log.size();) {
+      size_t end = log.find('\n', at);
+      if (end == std::string::npos)
+        end = log.size();
+      const std::string line = log.substr(at, end - at);
+      if (line.find("] layout ") != std::string::npos)
+        out += line + "\n";
+      at = end + 1;
+    }
+    if (out.size() > kLogTail)
+      out.erase(0, out.find('\n', out.size() - kLogTail) + 1);
+    return reply(fd, 200, "OK", "text/plain; charset=utf-8", out);
+  }
+  /*
+   * SteamGridDB (Tiles tab), the PS5 asks and answers the editor:
+   *   GET  /sgdb/search?q=<name>            games with that name (API JSON)
+   *   GET  /sgdb/grids?id=<game>&fmt=2x3|1x1|92x43|16x9|logo&page=<n>  pictures (API JSON)
+   *   GET  /sgdb/img?kind=preview|download&u=<cdn url>  a thumbnail or a full picture
+   *        (download = the picture chosen: a slot of its own, no total timeout)
+   * The editor saves the chosen picture itself (/customtile, /custombg).
+   * The API key comes in the X-Key header (the editor's steamGridKey field).
+   */
+  /*
+   * motionbgs.com (Pictures tab, Background 16:9 with "Animated only"):
+   * the user searches the site from the editor through the PS5 (the site
+   * sends no CORS headers). Nothing of it is kept or shipped by ZhiThemes:
+   * the editor shows the results and the video the user picks goes to
+   * custombg like any upload.
+   *   GET /mbg/search?q=<name>              the results page (HTML)
+   *   GET /mbg/page?p=tag:<name>/<n>/       another page of a tag
+   *   GET /mbg/img?u=/i/c/<w>x<h>/media/<id>/<file>.jpg   a thumbnail
+   *   GET /mbg/img?u=/media/<id>/<name>.960x540.mp4         its small preview video
+   *   GET /mbg/video?id=<n>                 its HD MP4 (1920x1080)
+   * search / page answer "<path of the page>\n<html>" (a search can be
+   * sent on to the tag's page, whose next pages are /tag:<name>/<n>/).
+   */
+  if (method == "GET" && path.rfind("/mbg/", 0) == 0) {
+    const std::string site = "https://motionbgs.com/";
+    if (path == "/mbg/search" || path == "/mbg/page") {
+      std::string ask;
+      if (path == "/mbg/search") {
+        const std::string q = query_value(query, "q");
+        if (q.empty() || q.size() > 120)
+          return reply(fd, 400, "Bad Request", "text/plain", "bad name");
+        ask = "search?q=" + url_encode(q);
+      } else {
+        ask = query_value(query, "p");
+        bool ok = ask.size() > 4 && ask.size() < 160 && ask.rfind("tag:", 0) == 0 && ask.find("..") == std::string::npos;
+        for (char c : ask)
+          if (!(isalnum((unsigned char)c) || c == ':' || c == '/' || c == '-' || c == '_' || c == '.'))
+            ok = false;
+        if (!ok)
+          return reply(fd, 400, "Bad Request", "text/plain", "bad page");
+      }
+      std::string html, final_url, err;
+      long http = 0;
+      if (!zt_web_page(site + ask, html, final_url, http, err, 4u << 20))
+        return reply(fd, 502, "Bad Gateway", "text/plain", "motionbgs: " + err);
+      if (http != 200)
+        return reply(fd, 502, "Bad Gateway", "text/plain", "motionbgs: HTTP " + std::to_string(http));
+      const std::string at = final_url.rfind(site, 0) == 0 ? final_url.substr(site.size()) : ask;
+      return reply(fd, 200, "OK", "text/plain; charset=utf-8", at + "\n" + html);
+    }
+    if (path == "/mbg/img" || path == "/mbg/video") {
+      std::string url;
+      const char *mime = "video/mp4";
+      size_t max = 200u << 20;
+      if (path == "/mbg/img") {
+        const std::string u = query_value(query, "u");
+        bool ok = u.rfind("/i/c/", 0) == 0 && u.size() < 220 && u.find("..") == std::string::npos;
+        for (char c : u)
+          if (!(isalnum((unsigned char)c) || c == '/' || c == '-' || c == '_' || c == '.'))
+            ok = false;
+        /* thumbnails /i/c/...jpg|webp, or the site's small preview video
+           /media/<id>/<name>.960x540.mp4 (the moving thumbnails) */
+        const bool media = u.rfind("/media/", 0) == 0;
+        if (media && u.size() < 220 && u.find("..") == std::string::npos) {
+          ok = true;
+          for (char c : u)
+            if (!(isalnum((unsigned char)c) || c == '/' || c == '-' || c == '_' || c == '.'))
+              ok = false;
+        }
+        const bool webp = !media && u.size() > 5 && u.compare(u.size() - 5, 5, ".webp") == 0;
+        const bool jpg = !media && u.size() > 4 && u.compare(u.size() - 4, 4, ".jpg") == 0;
+        const std::string tail = ".960x540.mp4";
+        const bool preview = media && u.size() > tail.size() && u.compare(u.size() - tail.size(), tail.size(), tail) == 0;
+        if (!ok || !(webp || jpg || preview))
+          return reply(fd, 400, "Bad Request", "text/plain", "bad picture");
+        url = site + u.substr(1);
+        mime = webp ? "image/webp" : jpg ? "image/jpeg" : "video/mp4";
+        max = preview ? 40u << 20 : 4u << 20;
+      } else {
+        const std::string id = query_value(query, "id");
+        bool num = !id.empty() && id.size() < 10;
+        for (char c : id)
+          if (c < '0' || c > '9')
+            num = false;
+        if (!num)
+          return reply(fd, 400, "Bad Request", "text/plain", "bad video");
+        url = site + "dl/hd/" + id + "/";
+        zt_log("mbg: video %s asked", id.c_str());
+      }
+      /* handed on as it comes, from a thread of its own (as /sgdb/img) */
+      auto *job = new SgdbImgJob{fd, url, mime, "motionbgs", max};
+      pthread_t t;
+      pthread_mutex_lock(&g_asset_lock);
+      const bool room = g_asset_clients < 4;
+      if (room)
+        ++g_asset_clients;
+      pthread_mutex_unlock(&g_asset_lock);
+      if (room && pthread_create(&t, nullptr, sgdb_img_client, job) == 0) {
+        pthread_detach(t);
+        g_fd_taken = true;
+        return;
+      }
+      if (room) {
+        pthread_mutex_lock(&g_asset_lock);
+        --g_asset_clients;
+        pthread_mutex_unlock(&g_asset_lock);
+      }
+      sgdb_img_send(fd, job->url, job->mime, job->who, job->max);
+      delete job;
+      return;
+    }
+    return reply(fd, 404, "Not Found", "text/plain", "not found");
+  }
+  /* the key lives on the PS5 (steamgrid.key): GET /sgdb/key says if
+     there is one (never the key), POST /sgdb/key saves the body ("" removes) */
+  if (path == "/sgdb/key") {
+    if (method == "POST") {
+      std::string k = body.substr(0, std::min<size_t>(body.size(), want));
+      while (!k.empty() && (k.back() == '\n' || k.back() == '\r' || k.back() == ' '))
+        k.pop_back();
+      while (!k.empty() && k[0] == ' ')
+        k.erase(0, 1);
+      if (!zt_sgdb_key_set(k))
+        return reply(fd, 400, "Bad Request", "text/plain", "not a key");
+    }
+    return reply(fd, 200, "OK", "application/json", zt_sgdb_key().empty() ? "{\"set\":false}" : "{\"set\":true}");
+  }
+  if (path.rfind("/sgdb/", 0) == 0) {
+    const std::string key = zt_sgdb_key();
+    const std::string api = "https://www.steamgriddb.com/api/v2/";
+    std::string out, err, url;
+    long http = 0;
+    const std::string fmt = query_value(query, "fmt");
+    if (method == "GET" && (path == "/sgdb/search" || path == "/sgdb/grids")) {
+      if (key.empty())
+        return reply(fd, 400, "Bad Request", "text/plain", "no SteamGridDB API key on the PS5 (Tiles tab)");
+      if (path == "/sgdb/search") {
+        const std::string q = query_value(query, "q");
+        if (q.empty() || q.size() > 120)
+          return reply(fd, 400, "Bad Request", "text/plain", "bad name");
+        url = api + "search/autocomplete/" + url_encode(q);
+      } else {
+        const std::string id = query_value(query, "id"), page = query_value(query, "page");
+        bool num = !id.empty() && id.size() < 12;
+        for (char c : id + page)
+          if (c < '0' || c > '9')
+            num = false;
+        if (!num || (fmt != "2x3" && fmt != "1x1" && fmt != "92x43" && fmt != "16x9" && fmt != "logo"))
+          return reply(fd, 400, "Bad Request", "text/plain", "bad game or format");
+        /* anim=1 -> only the animated pictures (Steam Deck style:
+           animated WebP or APNG on SteamGridDB) */
+        const bool anim = query_value(query, "anim") == "1";
+        const std::string kind = anim ? "&types=animated&mimes=image/webp,image/png"
+                                      : "&types=static&mimes=image/png,image/jpeg";
+        /* 16x9: game backgrounds from the heroes. every size and
+           PNG or JPEG (asked for 3840x1240/1920x620 PNG only and
+           many games had none); the editor makes the 1920x1080 picture */
+        if (fmt == "16x9")
+          url = api + "heroes/game/" + id + "?nsfw=false&humor=any&limit=12" + kind;
+        /* game logos (transparent PNG; the editor trims them and
+           uploads <ID>_logo_<n>.png to customtile) */
+        else if (fmt == "logo")
+          url = api + "logos/game/" + id + "?nsfw=false&humor=any&limit=12" +
+                (anim ? kind : "&types=static&mimes=image/png");
+        else
+          /* 92x43 = the Steam horizontal capsule (460x215 / 920x430) */
+          url = api + "grids/game/" + id + "?dimensions=" +
+                (fmt == "2x3" ? "600x900" : fmt == "92x43" ? "460x215,920x430" : "512x512,1024x1024") +
+                "&nsfw=false&humor=any&limit=12" + kind;
+        url += page.empty() ? "" : "&page=" + page;
+      }
+      if (!zt_sgdb_get(url, key, out, http, err, 4u << 20))
+        return reply(fd, 502, "Bad Gateway", "text/plain", "SteamGridDB: " + err);
+      return reply(fd, http == 200 ? 200 : 502, http == 200 ? "OK" : "Bad Gateway", "application/json", out);
+    }
+    if (method == "GET" && path == "/sgdb/img") {
+      url = query_value(query, "u");
+      const size_t dot = url.rfind('.');
+      std::string ext = dot == std::string::npos ? "" : url.substr(dot + 1);
+      for (char &c : ext)
+        c = (char)tolower((unsigned char)c);
+      if (ext == "jpeg")
+        ext = "jpg";
+      /* the animated pictures (webp, and their thumbnails) are only
+         shown in the editor; the editor sends the PS5 a PNG */
+      const bool anim_ext = ext == "webp" || ext == "gif" || ext == "webm" || ext == "mp4";
+      if (ext != "png" && ext != "jpg" && !anim_ext)
+        return reply(fd, 400, "Bad Request", "text/plain", "png or jpg pictures only");
+      {
+        /* also the full picture (the editor cuts the 16:9 background from it) */
+        const char *mime = ext == "png" ? "image/png" : ext == "jpg" ? "image/jpeg" : ext == "webp" ? "image/webp"
+                         : ext == "gif" ? "image/gif" : ext == "webm" ? "video/webm" : "video/mp4";
+        /* handed on as it comes from the CDN (no second download, the
+           editor sees the progress), from a thread of its own so the
+           editor's other requests do not wait behind a big picture */
+        const std::string kind = query_value(query, "kind");
+        const bool priority = kind == "download";
+        auto *job = new SgdbImgJob{fd, url, mime, "SteamGridDB", 400u << 20, kind == "preview", priority};
+        pthread_t t;
+        pthread_mutex_lock(&g_asset_lock);
+        const bool room = priority ? !g_sgdb_download_active
+                                   : g_asset_clients - (int)g_sgdb_download_active < 4;
+        if (room) {
+          ++g_asset_clients;
+          if (priority)
+            g_sgdb_download_active = true;
+        }
+        pthread_mutex_unlock(&g_asset_lock);
+        if (room && pthread_create(&t, nullptr, sgdb_img_client, job) == 0) {
+          pthread_detach(t);
+          g_fd_taken = true;
+          return;
+        }
+        if (room) {
+          pthread_mutex_lock(&g_asset_lock);
+          if (priority)
+            g_sgdb_download_active = false;
+          --g_asset_clients;
+          pthread_mutex_unlock(&g_asset_lock);
+        }
+        delete job;
+        return reply(fd, 503, "Service Unavailable", "text/plain",
+                     priority ? "An artwork download is still running. Try again when it finishes."
+                              : "The artwork preview slots are busy. Try again.");
+      }
+    }
+    return reply(fd, 404, "Not Found", "text/plain", "not found");
+  }
+  /* POST /avatar/delete?name=<file>: one file of <dir>/avatars */
+  if (method == "POST" && path == "/avatar/delete") {
+    const std::string name = query.rfind("name=", 0) == 0 ? query.substr(5) : "";
+    bool ok_name = !name.empty() && name.size() < 80 && name[0] != '.';
+    for (char c : name)
+      if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_'))
+        ok_name = false;
+    if (!ok_name)
+      return reply(fd, 400, "Bad Request", "text/plain", "invalid name");
+    const bool gone = unlink((std::string(ZT_AVATARS "/") + name).c_str()) == 0;
+    /* and the copy fitted on the PS5 (cache/<stem>_fit.gif) */
+    const size_t dot = name.rfind('.');
+    const std::string fit = std::string(ZT_AVATARS "/cache/") +
+                            (dot == std::string::npos || dot == 0 ? name : name.substr(0, dot)) + "_fit.gif";
+    unlink(fit.c_str());
+    unlink((fit + ".meta").c_str());
+    zt_logl('A', "web: avatar %s %s", name.c_str(), gone ? "deleted" : "NOT deleted");
+    return gone ? reply(fd, 200, "OK", "text/plain", "deleted") : reply(fd, 404, "Not Found", "text/plain", "missing");
+  }
+  /* GET /customtile?name=<file>: one picture of <dir>/customtile (the
+     editor's Tiles tab shows them); /custombg the same for the game
+     backgrounds. POST /customtile/delete?name=, /custombg/delete?name=
+     remove one */
+  if ((method == "GET" && (path == "/customtile" || path == "/custombg")) ||
+      (method == "POST" && (path == "/customtile/delete" || path == "/custombg/delete"))) {
+    const bool bg = path.rfind("/custombg", 0) == 0;
+    const std::string name = query.rfind("name=", 0) == 0 ? query.substr(5) : "";
+    bool ok_name = !name.empty() && name.size() < 80 && name[0] != '.';
+    for (char c : name)
+      if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_'))
+        ok_name = false;
+    const size_t dot = name.rfind('.');
+    std::string ext = dot == std::string::npos ? "" : name.substr(dot + 1);
+    for (char &c : ext)
+      c = (char)tolower((unsigned char)c);
+    /* customtile <name>.mp4 = the animated version of <name>.png */
+    if (!ok_name || (ext != "png" && ext != "jpg" && ext != "jpeg" && ext != "mp4"))
+      return reply(fd, 400, "Bad Request", "text/plain", "pictures only");
+    const std::string file = std::string(bg ? ZT_CUSTOMBG "/" : ZT_CUSTOMTILE "/") + name;
+    if (method == "POST") {
+      const bool gone = unlink(file.c_str()) == 0;
+      zt_logl('A', "web: %s %s %s", bg ? "custombg" : "customtile", name.c_str(), gone ? "deleted" : "NOT deleted");
+      return gone ? reply(fd, 200, "OK", "text/plain", "deleted") : reply(fd, 404, "Not Found", "text/plain", "missing");
+    }
+    const std::string data = read_file(file.c_str());
+    if (data.empty())
+      return reply(fd, 404, "Not Found", "text/plain", "missing");
+    return reply(fd, 200, "OK", ext == "png" ? "image/png" : ext == "mp4" ? "video/mp4" : "image/jpeg", data);
+  }
+  /* GET /fonts, GET /backgrounds, GET /customtiles: the files sent
+     above, as a JSON list of names */
+  /* V50: GET /xmbwaves -> "<name> <bytes>" per line: the month waves already on the console (the upload script skips those) */
+  if (method == "GET" && path == "/xmbwaves") {
+    std::string out;
+    if (DIR *d = opendir(ZT_DIR "/xmbwaves")) {
+      while (dirent *e = readdir(d)) {
+        const std::string name = e->d_name;
+        if (name.rfind("XMB5_Wave_", 0) != 0 || name.find_first_of(" \r\n") != std::string::npos) continue;
+        struct stat st {};
+        if (stat((std::string(ZT_DIR "/xmbwaves/") + name).c_str(), &st) == 0 && S_ISREG(st.st_mode))
+          out += name + " " + std::to_string((long long)st.st_size) + "\n";
+      }
+      closedir(d);
+    }
+    return reply(fd, 200, "OK", "text/plain", out);
+  }
+  /* V73: GET /xmbicons -> "<name> <bytes>" per line: the custom column icons on the console */
+  if (method == "GET" && path == "/xmbicons") {
+    std::string out;
+    if (DIR *d = opendir(ZT_DIR "/xmbicons")) {
+      while (dirent *e = readdir(d)) {
+        const std::string name = e->d_name;
+        if (name.size() < 5 || name.compare(name.size() - 4, 4, ".png") != 0 || name.find_first_of(" \r\n") != std::string::npos) continue;
+        struct stat st {};
+        if (stat((std::string(ZT_DIR "/xmbicons/") + name).c_str(), &st) == 0 && S_ISREG(st.st_mode))
+          out += name + " " + std::to_string((long long)st.st_size) + "\n";
+      }
+      closedir(d);
+    }
+    return reply(fd, 200, "OK", "text/plain", out);
+  }
+  if (method == "GET" && (path == "/fonts" || path == "/backgrounds" || path == "/customtiles" || path == "/custombgs")) {
+    std::string json = "[";
+    /* /backgrounds?kind=wallpapers|icons|folders (wallpapers when left out) */
+    const std::string kind = query_value(query, "kind");
+    /* wallpapers, icons, fonts of the active theme (&theme= another one) */
+    const std::string theme = query_value(query, "theme");
+    const std::string tn = zt_theme_name_ok(theme) ? theme : std::string();
+    const std::string dir = path == "/customtiles" ? std::string(ZT_CUSTOMTILE) : path == "/custombgs" ? std::string(ZT_CUSTOMBG)
+                          : path == "/fonts" ? zt_theme_dir_of(tn, "fonts")
+                          : kind == "icons" ? zt_theme_dir_of(tn, "icons") : kind == "folders" ? std::string(ZT_FOLDERS)
+                          : kind == "avatars" ? std::string(ZT_AVATARS)
+                          : kind == "mosaics" ? std::string(ZT_CACHE_MOSAICS) : zt_theme_dir_of(tn, "wallpapers");
+    if (DIR *d = opendir(dir.c_str())) {
+      while (dirent *e = readdir(d)) {
+        const std::string name = e->d_name;
+        if (e->d_type == DT_DIR) /* avatars/cache */
+          continue;
+        if (name[0] == '.' || name.find_first_of("\"\\") != std::string::npos ||
+            (name.size() > 5 && name.compare(name.size() - 5, 5, ".part") == 0))
+          continue;
+        json += (json.size() > 1 ? ",\"" : "\"") + name + "\"";
+      }
+      closedir(d);
+    }
+    return reply(fd, 200, "OK", "application/json", json + "]");
+  }
+  /* V82: game-console-only full unload. The Home script calls this over 127.0.0.1;
+   * do not expose a remote endpoint that can disable the user's console UI. */
+  if (method == "POST" && path == "/xmb-unload") {
+    sockaddr_in peer{};
+    socklen_t peerlen=sizeof(peer);
+    if (getpeername(fd,reinterpret_cast<sockaddr*>(&peer),&peerlen)!=0 ||
+        peer.sin_family!=AF_INET || peer.sin_addr.s_addr!=htonl(INADDR_LOOPBACK))
+      return reply(fd,403,"Forbidden","text/plain","loopback only");
+    zt_log("PS5XMB: FULL_UNLOAD_REQUESTED");
+    zt_xmb_music_shutdown();
+    zt_xmb_sfx_shutdown(); // join audio thread before removing any hooks
+    // Mark this watcher as obsolete. It detects the changed pid and exits.
+    if (FILE *pf=fopen(ZT_DIR "/watcher.pid", "w")) { fputs("1",pf); fclose(pf); }
+    theme_request_full_unload();
+    for (int i=0; i<60 && !theme_full_unload_done(); ++i) usleep(100000);
+    if (!theme_full_unload_done()) {
+      zt_log("PS5XMB: FULL_UNLOAD_TIMEOUT UI thread did not acknowledge");
+      return reply(fd,503,"Unavailable","text/plain","Home UI unload not acknowledged");
+    }
+    g_web_quit=true;
+    video_stop(); /* video_server sees g_web_quit and can actually exit */
+    int still_running=0;
+    for (int i=0; i<70; ++i) {
+      pthread_mutex_lock(&g_asset_lock);
+      still_running=g_asset_clients+g_info_clients+g_art_clients;
+      pthread_mutex_unlock(&g_asset_lock);
+      if (!still_running) break;
+      usleep(100000);
+    }
+    if (still_running) zt_log("PS5XMB: FULL_UNLOAD_WAIT_CLIENTS remaining=%d",still_running);
+    return reply(fd,200,"OK","text/plain","XMB5 hooks reverted; Sony Home reloaded");
+  }
+
+  /* GET /idle: ms since the Home focus last moved (-1 = not known); a newer
+     ZhiThemes waits for a still Home before POST /quit */
+  if (method == "GET" && path == "/idle")
+    return reply(fd, 200, "OK", "text/plain", std::to_string(theme_idle_ms()));
+  if (method == "POST" && path == "/quit") {
+    zt_xmb_music_shutdown();
+    zt_xmb_sfx_shutdown(); /* join audio thread before unloading its code */
+    const int n = theme_unload();
+    g_web_quit = true;
+    video_stop();
+    /* /asset threads stop at their next piece (5 s send timeout at most)
+       before this module's code goes away */
+    for (int i = 0; i < 70; ++i) {
+      pthread_mutex_lock(&g_asset_lock);
+      const int left = g_asset_clients;
+      pthread_mutex_unlock(&g_asset_lock);
+      if (left == 0)
+        break;
+      usleep(100000);
+    }
+    return reply(fd, 200, "OK", "text/plain", "bye " + std::to_string(n));
+  }
+  /*
+   * GET /system/fonts: every font folder ShellUI can see. /system/common
+   * cannot be listed from ShellUI, but it opens its fonts through its own
+   * sandbox mount ("/<random>/common/font/..."): every top folder is tried
+   * with common/font, common/font2, common_ex/font, common_ex/font2.
+   * GET /system/f/<path> downloads one of them (only paths
+   * with "/font" and a font extension).
+   */
+  if (method == "GET" && path == "/system/fonts") {
+    std::string html = "<!doctype html><meta charset=utf-8><title>PS5 fonts</title>"
+                       "<body style='font-family:sans-serif;background:#111;color:#eee'>"
+                       "<h2>Fonts ShellUI can read</h2>";
+    static const char *const subs[] = {"common/font", "common/font2", "common_ex/font",
+                                       "common_ex/font2"};
+    int found = 0;
+    std::vector<std::string> roots = {"/system", "/system_ex", "/preinst"};
+    if (DIR *top = opendir("/")) {
+      while (dirent *e = readdir(top))
+        if (e->d_name[0] != '.')
+          roots.push_back(std::string("/") + e->d_name);
+      closedir(top);
+    }
+    for (const std::string &root : roots)
+      for (const char *sub : subs) {
+        const std::string dir = root + "/" + sub;
+        DIR *d = opendir(dir.c_str());
+        if (!d)
+          continue;
+        html += "<h3>" + dir + "</h3><ul>";
+        while (dirent *e = readdir(d)) {
+          if (e->d_name[0] == '.')
+            continue;
+          const std::string file = dir + "/" + e->d_name;
+          struct stat st = {};
+          stat(file.c_str(), &st);
+          html += "<li><a style='color:#6cf' href='/system/f" + file + "'>" +
+                  e->d_name + "</a> (" + std::to_string((long)st.st_size) + " bytes)</li>";
+          ++found;
+        }
+        closedir(d);
+        html += "</ul>";
+      }
+    if (!found)
+      html += "<p>No font folder is accessible.</p>";
+    return reply(fd, 200, "OK", "text/html; charset=utf-8", html);
+  }
+  /* /system/f/<path>: the browser saves it with the font's own name */
+  if (method == "GET" && path.rfind("/system/f/", 0) == 0) {
+    const std::string file = path.substr(9);
+    const size_t dot = file.rfind('.');
+    const std::string ext = dot == std::string::npos ? "" : file.substr(dot);
+    const bool font_ext = ext == ".otf" || ext == ".ttf" || ext == ".ttc" || ext == ".pfb";
+    if (file.find("/font") == std::string::npos || !font_ext ||
+        file.find("..") != std::string::npos)
+      return reply(fd, 400, "Bad Request", "text/plain", "font files only");
+    const std::string data = read_file(file.c_str());
+    if (data.empty())
+      return reply(fd, 404, "Not Found", "text/plain", "no access");
+    return reply(fd, 200, "OK", "application/octet-stream", data);
+  }
+  /* GET /games: the Games row (folders tab of the editor) */
+  if (method == "GET" && path == "/games")
+    return reply(fd, 200, "OK", "application/json; charset=utf-8", theme_games());
+  /* GET /icon?p=/user/app/<id>/sce_sys/icon0.png: a tile icon for the editor
+     (only .png under the app folders) */
+  if (method == "GET" && path == "/icon") {
+    const std::string file = query.rfind("p=", 0) == 0 ? query.substr(2) : "";
+    const bool app_dir = file.rfind("/user/app/", 0) == 0 || file.rfind("/user/appmeta/", 0) == 0 ||
+                         file.rfind("/system_ex/rnps/apps/", 0) == 0;
+    const bool png = file.size() > 4 && file.compare(file.size() - 4, 4, ".png") == 0;
+    if (!app_dir || !png || file.find("..") != std::string::npos)
+      return reply(fd, 400, "Bad Request", "text/plain", "app icons only");
+    const std::string data = read_file(file.c_str());
+    if (data.empty())
+      return reply(fd, 404, "Not Found", "text/plain", "no access");
+    return reply(fd, 200, "OK", "image/png", data);
+  }
+  /* GET /sysicon?name=game: a system icon (IconPS id) from the console's
+     own RCO, for the editor's icon picker */
+  if (method == "GET" && path == "/sysicon") {
+    const std::string name = query_value(query, "name");
+    bool safe = !name.empty() && name.size() < 80;
+    for (char c : name)
+      if (!isalnum((unsigned char)c) && c != '_' && c != '-')
+        safe = false;
+    if (!safe)
+      return reply(fd, 400, "Bad Request", "text/plain", "icon names only");
+    std::string data, type;
+    if (!zt_sysicon(name, data, type))
+      return reply(fd, 404, "Not Found", "text/plain", "no such icon");
+    return reply(fd, 200, "OK", type.c_str(), data);
+  }
+  /* the system's icon font (controller buttons), to read its glyph codes */
+  if (method == "GET" && path == "/system/PS4Icon.ttf") {
+    const std::string font = read_file("/system_ex/common_ex/font2/PS4Icon.ttf");
+    if (font.empty())
+      return reply(fd, 404, "Not Found", "text/plain", "no access");
+    return reply(fd, 200, "OK", "font/ttf", font);
+  }
+  /* Home reloads in this ShellUI (the editor shows it next to Apply) */
+  if (method == "GET" && path == "/reloads") {
+    char text[24];
+    snprintf(text, sizeof(text), "%d", zt_log_reloads());
+    return reply(fd, 200, "OK", "text/plain", text);
+  }
+  if (method == "GET" && path == "/version") {
+    /* which build, when this copy started and its hooks: after sending a
+       new ELF the start time must change, hooks stay the same count and
+       "doubles" must be 0 (the old copy left) */
+    int hooks = 0, doubles = 0;
+    theme_status(&hooks, &doubles);
+    char text[240];
+    const long ago = (long)(time(nullptr) - g_started);
+    struct tm at = {};
+    gmtime_r(&g_started, &at);
+    snprintf(text, sizeof(text),
+             "%s " ZT_VERSION " (build " ZT_BUILD_TEXT ") %s %s | started %02d:%02d:%02d UTC, %ld min %ld s ago | hooks=%d doubles=%d",
+#if defined(ZHITHEMES) && ZHITHEMES
+             "XMB5",
+#else
+             "onionhen",
+#endif
+             __DATE__, __TIME__, at.tm_hour, at.tm_min, at.tm_sec, ago / 60, ago % 60,
+             hooks, doubles);
+    return reply(fd, 200, "OK", "text/plain", text);
+  }
+  /* GET /asset?kind=wallpapers|icons|fonts&name=x: one file the theme uses,
+     for the editor's theme pack (Download); sent a piece at a time (videos
+     can be big). Older files may still be in backgrounds/. */
+  if (method == "GET" && path == "/asset") {
+    const std::string kind = query_value(query, "kind");
+    const std::string name = url_decode(query_value(query, "name"));
+    bool ok_name = !name.empty() && name.size() < 80 && name[0] != '.';
+    for (char c : name)
+      if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_'))
+        ok_name = false;
+    const std::string dir = kind == "wallpapers" || kind == "icons" || kind == "fonts" ? zt_theme_dir(kind.c_str())
+                          : kind == "avatars" ? std::string(ZT_AVATARS) : std::string();
+    if (!ok_name || dir.empty())
+      return reply(fd, 400, "Bad Request", "text/plain", "invalid kind or name");
+    std::string file = dir + "/" + name;
+    int in = open(file.c_str(), O_RDONLY);
+    if (in < 0 && kind != "fonts")
+      in = open((std::string(ZT_LEGACY "/") + name).c_str(), O_RDONLY);
+    struct stat st;
+    if (in < 0 || fstat(in, &st) != 0) {
+      if (in >= 0)
+        close(in);
+      return reply(fd, 404, "Not Found", "text/plain", "no such file");
+    }
+    char head[256];
+    const int n = snprintf(head, sizeof(head),
+                           "HTTP/1.0 200 OK\r\n"
+                           "Content-Type: application/octet-stream\r\n"
+                           "Content-Length: %lld\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "Connection: close\r\n\r\n",
+                           (long long)st.st_size);
+    /* sent from a thread of its own: the editor's Visual tab asks for
+       the wallpaper video here (tens of MB, the browser reads it slowly) and
+       everything else (Use theme, Apply…) waited behind it */
+    auto *job = new AssetJob{fd, in, n > 0 ? std::string(head, (size_t)n) : std::string()};
+    pthread_t t;
+    pthread_mutex_lock(&g_asset_lock);
+    const bool room = g_asset_clients < 4;
+    if (room)
+      ++g_asset_clients;
+    pthread_mutex_unlock(&g_asset_lock);
+    if (room && pthread_create(&t, nullptr, asset_client, job) == 0) {
+      pthread_detach(t);
+      g_fd_taken = true;
+      return;
+    }
+    if (room) {
+      pthread_mutex_lock(&g_asset_lock);
+      --g_asset_clients;
+      pthread_mutex_unlock(&g_asset_lock);
+    }
+    job->fd = -1; /* sent here; the server thread closes fd */
+    asset_send(fd, *job);
+    delete job;
+    return;
+  }
+  /* ZhiThemes' own update (zt_update.cpp): GET = the state, POST
+     ?do=check|install|retry|dismiss|auto1|auto0 */
+  if (path == "/update") {
+    if (method == "POST") {
+      const std::string err = zt_update_cmd(query_value(query, "do"));
+      if (!err.empty())
+        return reply(fd, 409, "Conflict", "text/plain", err);
+    }
+    return reply(fd, 200, "OK", "application/json", zt_update_json());
+  }
+  if (method == "GET" && path == "/sysinfo")
+    return reply(fd, 200, "OK", "application/json", zt_sysinfo_json());
+  if (method == "GET" && path == "/logs")
+    return reply(fd, 200, "OK", "application/json", zt_log_list_json());
+  if (method == "GET" && path == "/logs/file") {
+    const std::string name = url_decode(query_value(query, "name"));
+    const std::string file = zt_log_path(name);
+    if (file.empty())
+      return reply(fd, 404, "Not Found", "text/plain", "no such log");
+    /* sent in pieces (zhithemes.log can be 16 MB), up to the size it had
+       when asked (lines still being added go in the next download) */
+    const int in = open(file.c_str(), O_RDONLY);
+    struct stat st;
+    if (in < 0 || fstat(in, &st) != 0) {
+      if (in >= 0)
+        close(in);
+      return reply(fd, 404, "Not Found", "text/plain", "no such log");
+    }
+    char head[384];
+    const int n = snprintf(head, sizeof(head),
+                           "HTTP/1.0 200 OK\r\n"
+                           "Content-Type: text/plain; charset=utf-8\r\n"
+                           "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                           "Content-Length: %lld\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "Connection: close\r\n\r\n",
+                           name.c_str(), (long long)st.st_size);
+    if (n > 0 && send_all(fd, head, (size_t)n)) {
+      std::vector<char> buf(65536);
+      for (off_t left = st.st_size; left > 0;) {
+        const ssize_t got = read(in, buf.data(), (size_t)std::min<off_t>(left, (off_t)buf.size()));
+        if (got <= 0 || !send_all(fd, buf.data(), (size_t)got))
+          break;
+        left -= got;
+      }
+    }
+    close(in);
+    return;
+  }
+  if (method == "POST" && path == "/logs/delete") {
+    const std::string name = url_decode(query_value(query, "name"));
+    const std::string file = zt_log_path(name);
+    if (file.empty() || name == "xmb5.log")
+      return reply(fd, 400, "Bad Request", "text/plain", "cannot delete that");
+    unlink(file.c_str());
+    return reply(fd, 200, "OK", "text/plain", "deleted");
+  }
+  if (method == "POST" && path == "/debug") {
+    const bool on = query_value(query, "on") == "1";
+    const bool sys = query_value(query, "sys") == "1";
+    const std::string saved = zt_debug_set(on, sys);
+    /* the Home and the hub run theme.js again, with the new __ztDebug */
+    shellui_request_hub_reload();
+    shellui_request_home_reload();
+    return reply(fd, 200, "OK", "application/json",
+                 std::string("{\"debug\":") + (on ? "true" : "false") + ",\"saved\":\"" + saved + "\"}");
+  }
+  /* seconds the payload's watcher waits after a ShellUI restart before
+     injecting again (inject_delay, read by the watcher each time; 15 when
+     missing) */
+  if ((method == "GET" || method == "POST") && path == "/injectdelay") {
+    const std::string file = ZT_DIR "/inject_delay";
+    if (method == "POST") {
+      int s = atoi(query_value(query, "s").c_str());
+      s = s < 5 ? 5 : s > 120 ? 120 : s;
+      const int out = open(file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      if (out >= 0) {
+        const std::string text = std::to_string(s);
+        (void)write(out, text.data(), text.size());
+        close(out);
+      }
+      zt_logl('A', "web: inject delay %d s", s);
+    }
+    int s = atoi(read_file(file.c_str()).c_str());
+    if (s < 5 || s > 120)
+      s = 15;
+    return reply(fd, 200, "OK", "application/json", "{\"seconds\":" + std::to_string(s) + "}");
+  }
+  /* Report a problem (editor): body = "what happened" (plain text); the
+     answer is the report as a download */
+  if (method == "POST" && path == "/report") {
+    std::string what = body.substr(0, 4000);
+    for (char &ch : what)
+      if (ch == '\r')
+        ch = ' ';
+    const std::string text = zt_report_text(what, "editor");
+    const std::string name = zt_report_name();
+    char head[384];
+    const int n = snprintf(head, sizeof(head),
+                           "HTTP/1.0 200 OK\r\n"
+                           "Content-Type: text/plain; charset=utf-8\r\n"
+                           "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                           "Content-Length: %zu\r\n"
+                           "Cache-Control: no-store\r\n"
+                           "Connection: close\r\n\r\n",
+                           name.c_str(), text.size());
+    if (n > 0 && send_all(fd, head, (size_t)n))
+      send_all(fd, text.data(), text.size());
+    return;
+  }
+  if (method == "POST" && path == "/log/clear") {
+    zt_log_clear();
+    return reply(fd, 200, "OK", "text/plain", "cleared");
+  }
+  reply(fd, 404, "Not Found", "text/plain", "not found");
+}
+
+/* internal loopback API port, or -1 (errors logged once) */
+int open_server(int *last_error) {
+  const int srv = socket(AF_INET, SOCK_STREAM, 0);
+  if (srv < 0) {
+    if (*last_error != errno)
+      zt_log("web: socket failed (errno %d); retrying", errno);
+    *last_error = errno;
+    return -1;
+  }
+  const int one = 1;
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in addr = {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(kPort);
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* no LAN-facing website */
+  if (bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+      listen(srv, 4) != 0) {
+    if (*last_error != errno)
+      zt_log("web: cannot listen on port %d (errno %d); retrying", kPort,
+                     errno);
+    *last_error = errno;
+    close(srv);
+    return -1;
+  }
+  *last_error = 0;
+  zt_log("XMB5: local media/API server on port %d (no editor)", kPort);
+  return srv;
+}
+
+/*
+ * The editor must stay reachable: without it the watcher cannot ask this
+ * module to leave, and a new one went in on top of it (double hooks, the
+ * ShellUI fell). After a ShellUI restart accept() failed once with errno 163
+ * and the server used to stop for good; now the socket is made again.
+ */
+void *server_thread(void *) {
+  int last_error = 0;
+  while (!g_web_quit) {
+    const int srv = open_server(&last_error);
+    if (srv < 0) {
+      sleep(2);
+      continue;
+    }
+    for (;;) {
+      const int fd = accept(srv, nullptr, nullptr);
+      if (fd < 0) {
+        if (errno == EINTR)
+          continue;
+        zt_log("web: accept failed (errno %d); a reabrir a porta", errno);
+        break;
+      }
+      timeval tv = {5, 0};
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+      g_fd_taken = false;
+      handle(fd);
+      if (!g_fd_taken)
+        close(fd);
+      g_fd_taken = false;
+      if (g_web_quit)
+        break; /* frees the internal API port for the new module */
+    }
+    close(srv);
+    if (!g_web_quit)
+      sleep(1);
+  }
+  return nullptr;
+}
+
+/*
+ * Video wallpaper: the Home's RCTVideoPS (ReactVideoView -> Sce.Vsh.VideoPlayer)
+ * plays http URIs, so the .mp4 files of backgrounds/ are served on
+ * 127.0.0.1:4445 (only this console):
+ *
+ *   GET|HEAD /v/<name>.mp4   whole file (200) or a byte range (206)
+ *
+ * One thread per connection (the player opens several and reads them
+ * slowly); each one ends when the player goes, after 30 s without reading,
+ * or when this module leaves (POST /quit).
+ */
+constexpr int kVideoPort = 4445;
+constexpr int kVideoMaxClients = 8;
+int g_video_clients = 0;
+/* for the health line: requests answered and refused (all 8 taken) since
+   the module started; players of an old Home context that keep looping
+   after a reload show up as more requests a minute and full slots */
+unsigned g_video_accepted = 0, g_video_refused = 0;
+pthread_mutex_t g_video_lock = PTHREAD_MUTEX_INITIALIZER;
+/* accept() on the PS5 does not time out (SO_RCVTIMEO is ignored), so
+   after POST /quit the old module's video server kept port 4445 until the
+   next request (log: the new module's player got "missing" from the old
+   one, 30 s after the quit, and the wallpaper video started ~12 s late) */
+volatile bool g_video_running = false;
+int g_video_logs = 0;
+
+void video_log(const char *what, const std::string &name, long long a, long long b,
+               long long size) {
+  pthread_mutex_lock(&g_video_lock);
+  const bool show = g_video_logs < 40;
+  g_video_logs += show;
+  pthread_mutex_unlock(&g_video_lock);
+  if (show)
+    zt_log("video: %s %s bytes %lld-%lld of %lld", what, name.c_str(), a, b, size);
+}
+
+void video_handle(int fd) {
+  std::string req;
+  char buf[4096];
+  while (req.find("\r\n\r\n") == std::string::npos && req.size() < kMaxHeader) {
+    const ssize_t n = recv(fd, buf, sizeof(buf), 0);
+    if (n <= 0)
+      return;
+    req.append(buf, (size_t)n);
+  }
+  const size_t sp1 = req.find(' ');
+  const size_t sp2 = sp1 == std::string::npos ? sp1 : req.find(' ', sp1 + 1);
+  if (sp2 == std::string::npos)
+    return reply(fd, 400, "Bad Request", "text/plain", "bad request");
+  const std::string method = req.substr(0, sp1);
+  std::string path = req.substr(sp1 + 1, sp2 - sp1 - 1);
+  path = path.substr(0, path.find('?'));
+  const bool head_only = method == "HEAD";
+  /* /t/<name>.mp4 = an animated custom tile (customtile/); /b/<name>.mp4 = an animated game background (custombg/) */
+  const bool tile = path.rfind("/t/", 0) == 0, gbg = path.rfind("/b/", 0) == 0;
+  const bool cap = path.rfind("/c/", 0) == 0;   /* V78: /c/<index>.mp4 = a captured video of the Gallery's Video list */
+  if ((method != "GET" && !head_only) || (path.rfind("/v/", 0) != 0 && !tile && !gbg && !cap))
+    return reply(fd, 404, "Not Found", "text/plain", "not found");
+  const std::string name = path.substr(3);
+  bool ok_name = !name.empty() && name.size() < 80 && name[0] != '.';
+  for (char c : name)
+    if (!(isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_'))
+      ok_name = false;
+  std::string cap_path;
+  if (cap) { cap_path = zt_xmb_video_path(isdigit((unsigned char)name.c_str()[0]) ? atoi(name.c_str()) : -1); ok_name = ok_name && !cap_path.empty(); }
+  int vf = cap ? (ok_name ? open(cap_path.c_str(), O_RDONLY) : -1) : ok_name ? open(((tile ? std::string(ZT_CUSTOMTILE) : gbg ? std::string(ZT_CUSTOMBG) : zt_theme_dir("wallpapers")) + "/" + name).c_str(),
+                           O_RDONLY) : -1;
+  if (ok_name && vf < 0 && !tile && !gbg && !cap) /* not moved yet */
+    vf = open((std::string(ZT_LEGACY "/") + name).c_str(), O_RDONLY);
+  /* V49: the XMB5 wave loops (one per month, day and night) are copied by the user to ZT_DIR/xmbwaves */
+  if (ok_name && vf < 0 && !tile && !gbg && !cap && name.rfind("XMB5_Wave_", 0) == 0)
+    vf = open((std::string(ZT_DIR "/xmbwaves/") + name).c_str(), O_RDONLY);
+  struct stat st = {};
+  if (vf < 0 || fstat(vf, &st) != 0 || st.st_size <= 0) {
+    if (vf >= 0)
+      close(vf);
+    video_log("missing", name, 0, 0, 0);
+    return reply(fd, 404, "Not Found", "text/plain", "no such video");
+  }
+  const long long size = (long long)st.st_size;
+  /* the theme's Home music (wallpapers/ of the theme) is served here too */
+  const size_t ndot = name.rfind('.');
+  std::string next = ndot == std::string::npos ? "" : name.substr(ndot + 1);
+  for (char &c : next)
+    c = (char)tolower((unsigned char)c);
+  const char *mime = next == "mp3" ? "audio/mpeg" : next == "m4a" ? "audio/mp4" : next == "aac" ? "audio/aac"
+                   : next == "wav" ? "audio/wav" : next == "ogg" ? "audio/ogg" : next == "webm" || (cap && cap_path.size() > 5 && strcasecmp(cap_path.c_str() + cap_path.size() - 5, ".webm") == 0) ? "video/webm" : "video/mp4";
+  long long first = 0, last = size - 1;
+  bool ranged = false;
+  /* Range: bytes=a-b | bytes=a- | bytes=-n (one range only) */
+  for (size_t at = 0; (at = req.find("\r\n", at)) != std::string::npos;) {
+    at += 2;
+    if (strncasecmp(req.c_str() + at, "Range:", 6) != 0)
+      continue;
+    const char *r = strstr(req.c_str() + at, "bytes=");
+    if (!r)
+      break;
+    r += 6;
+    char *end = nullptr;
+    if (*r == '-') {
+      const long long n = strtoll(r + 1, &end, 10);
+      if (n > 0) {
+        first = n < size ? size - n : 0;
+        ranged = true;
+      }
+    } else {
+      first = strtoll(r, &end, 10);
+      if (end && *end == '-') {
+        ranged = true;
+        if (isdigit((unsigned char)end[1]))
+          last = strtoll(end + 1, nullptr, 10);
+      }
+    }
+    break;
+  }
+  if (last >= size)
+    last = size - 1;
+  if (ranged && (first < 0 || first >= size || first > last)) {
+    close(vf);
+    char head[160];
+    const int n = snprintf(head, sizeof(head),
+                           "HTTP/1.1 416 Range Not Satisfiable\r\n"
+                           "Content-Range: bytes */%lld\r\nContent-Length: 0\r\n"
+                           "Connection: close\r\n\r\n", size);
+    send_all(fd, head, (size_t)n);
+    return;
+  }
+  char head[400];
+  const long long length = last - first + 1;
+  const int hn = ranged
+      ? snprintf(head, sizeof(head),
+                 "HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\n"
+                 "Accept-Ranges: bytes\r\nContent-Range: bytes %lld-%lld/%lld\r\n"
+                 "Content-Length: %lld\r\nConnection: close\r\n\r\n",
+                 mime, first, last, size, length)
+      : snprintf(head, sizeof(head),
+                 "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nAccept-Ranges: bytes\r\n"
+                 "Content-Length: %lld\r\nConnection: close\r\n\r\n", mime, size);
+  video_log(head_only ? "head" : "send", name, first, last, size);
+  bool ok = send_all(fd, head, (size_t)hn);
+  std::vector<char> chunk(256u << 10);
+  for (long long at = first; ok && !head_only && at <= last && !g_web_quit;) {
+    const size_t want = (size_t)(last - at + 1 < (long long)chunk.size() ? last - at + 1
+                                                                       : (long long)chunk.size());
+    const ssize_t n = pread(vf, chunk.data(), want, (off_t)at);
+    if (n <= 0)
+      break;
+    ok = send_all(fd, chunk.data(), (size_t)n);
+    at += n;
+  }
+  close(vf);
+}
+
+void *video_client(void *arg) {
+  const int fd = (int)(intptr_t)arg;
+  video_handle(fd);
+  close(fd);
+  pthread_mutex_lock(&g_video_lock);
+  --g_video_clients;
+  pthread_mutex_unlock(&g_video_lock);
+  return nullptr;
+}
+
+void *video_server(void *) {
+  g_video_running = true;
+  bool told = false;
+  while (!g_web_quit) {
+    const int srv = socket(AF_INET, SOCK_STREAM, 0);
+    const int one = 1;
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(kVideoPort);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (srv >= 0)
+      setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (srv < 0 || bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+        listen(srv, 8) != 0) {
+      if (!told)
+        zt_log("video: cannot listen on 127.0.0.1:%d (errno %d); retrying",
+                       kVideoPort, errno);
+      told = true;
+      if (srv >= 0)
+        close(srv);
+      sleep(2);
+      continue;
+    }
+    zt_log("video: wallpaper videos on 127.0.0.1:%d", kVideoPort);
+    told = false;
+    /* accept with a 1 s timeout, so POST /quit frees the port */
+    timeval wait = {1, 0};
+    setsockopt(srv, SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof(wait));
+    while (!g_web_quit) {
+      const int fd = accept(srv, nullptr, nullptr);
+      if (fd < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+          continue;
+        zt_log("video: accept failed (errno %d); a reabrir a porta", errno);
+        break;
+      }
+      if (g_web_quit) { /* the wake-up connection of video_stop() */
+        close(fd);
+        break;
+      }
+      pthread_mutex_lock(&g_video_lock);
+      const bool room = g_video_clients < kVideoMaxClients;
+      g_video_clients += room;
+      if (room)
+        ++g_video_accepted;
+      else
+        ++g_video_refused;
+      pthread_mutex_unlock(&g_video_lock);
+      if (!room) {
+        close(fd);
+        continue;
+      }
+      timeval tv = {30, 0};
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+      pthread_t client;
+      if (pthread_create(&client, nullptr, video_client, (void *)(intptr_t)fd) != 0) {
+        close(fd);
+        pthread_mutex_lock(&g_video_lock);
+        --g_video_clients;
+        pthread_mutex_unlock(&g_video_lock);
+        continue;
+      }
+      pthread_detach(client);
+    }
+    close(srv);
+  }
+  g_video_running = false;
+  return nullptr;
+}
+
+/* wakes the accept() of the video server (a connection to itself) and waits
+   up to 3 s for it and its clients to stop */
+void video_stop() {
+  for (int i = 0; i < 30; ++i) {
+    pthread_mutex_lock(&g_video_lock);
+    const int clients = g_video_clients;
+    pthread_mutex_unlock(&g_video_lock);
+    if (!g_video_running && clients == 0)
+      break;
+    if (g_video_running) {
+      const int c = socket(AF_INET, SOCK_STREAM, 0);
+      if (c >= 0) {
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(kVideoPort);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        timeval tv = {0, 300000};
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        connect(c, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+        close(c);
+      }
+    }
+    usleep(100000);
+  }
+  zt_log("video: server %s", g_video_running ? "still running after 3 s" : "stopped");
+}
+
+} // namespace
+
+void zt_video_counts(int *open, unsigned *accepted, unsigned *refused) {
+  pthread_mutex_lock(&g_video_lock);
+  *open = g_video_clients;
+  *accepted = g_video_accepted;
+  *refused = g_video_refused;
+  pthread_mutex_unlock(&g_video_lock);
+}
+
+void theme_web_start() {
+  pthread_t thread;
+  if (pthread_create(&thread, nullptr, server_thread, nullptr) != 0) {
+    zt_log("web: pthread_create failed (errno %d)", errno);
+    return;
+  }
+  pthread_detach(thread);
+  pthread_t video;
+  if (pthread_create(&video, nullptr, video_server, nullptr) == 0)
+    pthread_detach(video);
+  else
+    zt_log("video: pthread_create failed (errno %d)", errno);
+}
+
+/* `key: '...'` of the theme's values gets value (added at the
+   top of the block when missing). The Home's Options menu writes the folders
+   this way. */
+bool theme_set_field(const std::string &key, const std::string &value) {
+  return theme_set_field_in(zt_theme_file(), key, value);
+}
+
+bool theme_set_field_in(const std::string &file, const std::string &key, const std::string &value) {
+  std::string src = zt_theme_read_path(file);
+  const size_t th = src.find("var THEME");
+  if (src.empty() || th == std::string::npos)
+    return false;
+  size_t block_end = src.find("\n  };", th);
+  if (block_end == std::string::npos)
+    block_end = src.size();
+  auto ident = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
+  for (size_t at = th; (at = src.find(key, at)) != std::string::npos && at < block_end;) {
+    size_t p = at + key.size();
+    const bool word = !ident(src[at - 1]) && (p >= src.size() || !ident(src[p]));
+    at = p;
+    if (!word)
+      continue;
+    while (p < src.size() && isspace((unsigned char)src[p]))
+      ++p;
+    if (p >= src.size() || src[p] != ':')
+      continue;
+    ++p;
+    while (p < src.size() && isspace((unsigned char)src[p]))
+      ++p;
+    if (p >= src.size() || src[p] != '\'')
+      continue;
+    size_t end = p + 1;
+    while (end < src.size() && src[end] != '\'' && src[end] != '\n')
+      end += src[end] == '\\' ? 2 : 1;
+    if (end >= src.size() || src[end] != '\'')
+      return false;
+    src.replace(p + 1, end - p - 1, value);
+    return zt_theme_write_path(file, src);
+  }
+  const size_t brace = src.find('{', th);
+  if (brace == std::string::npos)
+    return false;
+  src.insert(brace + 1, "\n    " + key + ": '" + value + "',");
+  return zt_theme_write_path(file, src);
+}
+
+/* `key: true|false` of the THEME block (Options menu > Quick settings);
+   added at the top of the block when missing */
+bool theme_set_bool(const std::string &key, bool on) {
+  const std::string file = zt_theme_file();
+  std::string src = zt_theme_read_path(file);
+  const size_t th = src.find("var THEME");
+  if (src.empty() || th == std::string::npos)
+    return false;
+  size_t block_end = src.find("\n  };", th);
+  if (block_end == std::string::npos)
+    block_end = src.size();
+  const std::string word = on ? "true" : "false";
+  auto ident = [](char c) { return isalnum((unsigned char)c) || c == '_'; };
+  for (size_t at = th; (at = src.find(key, at)) != std::string::npos && at < block_end;) {
+    size_t p = at + key.size();
+    const bool whole = !ident(src[at - 1]) && (p >= src.size() || !ident(src[p]));
+    at = p;
+    if (!whole)
+      continue;
+    while (p < src.size() && isspace((unsigned char)src[p]))
+      ++p;
+    if (p >= src.size() || src[p] != ':')
+      continue;
+    ++p;
+    while (p < src.size() && (src[p] == ' ' || src[p] == '\t'))
+      ++p;
+    /* the old value: a word or number up to , } or the line end */
+    size_t end = p;
+    while (end < src.size() && (ident(src[end]) || src[end] == '.' || src[end] == '-'))
+      ++end;
+    if (end == p)
+      return false;
+    src.replace(p, end - p, word);
+    return zt_theme_write_path(file, src);
+  }
+  const size_t brace = src.find('{', th);
+  if (brace == std::string::npos)
+    return false;
+  src.insert(brace + 1, "\n    " + key + ": " + word + ",");
+  return zt_theme_write_path(file, src);
+}
+
+#else
+
+void theme_web_start() {}
+bool theme_set_field(const std::string &, const std::string &) { return false; }
+bool theme_set_field_in(const std::string &, const std::string &, const std::string &) { return false; }
+bool theme_set_bool(const std::string &, bool) { return false; }
+
+#endif /* SHELLUI_THEME_WEB == 1 */

@@ -1,0 +1,4 @@
+PS5XMB Home modifications Copyright (C) 2026 mushidani / PS5XMB project.
+GNU GPL-3.0-or-later. Original ZhiThemes by Zhi copyright and GPLv3
+additional attribution terms remain fully effective. This is a modified
+version and is not the original ZhiThemes release.

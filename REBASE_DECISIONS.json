@@ -1,0 +1,45 @@
+{
+  "README.md": "Preserve exact V83.23 XMB5 UI and disabled editor",
+  "src/source/shellui/include/zt_brand.hpp": [
+    "XMB5 conflict precedence"
+  ],
+  "src/source/shellui/include/zt_native_theme.hpp": [
+    "both focus and MP4 interfaces"
+  ],
+  "src/source/shellui/src/homeui_js_inject.cpp": [
+    "XMB5 conflict precedence",
+    "new JSON snapshot validation",
+    "both XMB focus and upstream diagnostic probe",
+    "original script with native language data available",
+    "XMB5 conflict precedence",
+    "XMB5 conflict precedence"
+  ],
+  "src/source/shellui/src/prx.cpp": [
+    "unified startup logging"
+  ],
+  "src/source/shellui/src/theme_web.cpp": [
+    "both XMB and native new APIs",
+    "unified XMB5 log filename",
+    "both async art and new pack infrastructure",
+    "unified XMB5 log filename",
+    "XMB full unload plus upstream idle query"
+  ],
+  "src/source/shellui/src/zt_install.cpp": [
+    "new format diagnostic"
+  ],
+  "src/source/shellui/src/zt_log.cpp": [
+    "combined log with original XMB name"
+  ],
+  "src/source/shellui/src/zt_storage.cpp": [
+    "XMB lazy folders with new JSON read"
+  ],
+  "src/source/zhithemes/source/main.cpp": [
+    "XMB5 conflict precedence",
+    "wait before module swap",
+    "profile mirror before final still-Home swap",
+    "XMB5 conflict precedence",
+    "XMB5 conflict precedence"
+  ],
+  "theme/editor.html": "Preserve exact V83.23 XMB5 UI and disabled editor",
+  "theme/theme.js": "Preserve exact V83.23 XMB5 UI and disabled editor"
+}

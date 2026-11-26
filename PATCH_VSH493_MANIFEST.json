@@ -1,0 +1,256 @@
+{
+  "version": "PS5 XMB v1.4 - ORIGINAL VSH 4.93 PALETTE OVERWRITE",
+  "base": "Existing PS5XMB_Home_v1_4_ONE_ELF; latest Linkev wave bridge compatible",
+  "mode": "Overwrite in project root. Does not compile or install a console payload.",
+  "assets_source": "User-supplied vsh.zip: vsh/resource/qgl/lines.qrc indexed source",
+  "original_shaders_ported": false,
+  "RCO_icon_layout_mapped": false,
+  "media_upload_needed": false,
+  "files": [
+    {
+      "name": "BUILD_WITH_LINKEV_WAVE_WSL.sh",
+      "bytes": 1258,
+      "sha256": "d3b6036ed5ca76049d2b60250fecb820adbb4244cb08076401294242960782fb"
+    },
+    {
+      "name": "BUILD_XMB_HOME_WSL.sh",
+      "bytes": 2227,
+      "sha256": "52bb13dbc2ac3781cd63c0f65e3beb0c12a0d63f4b5eec15c7ddc2e72fec88aa"
+    },
+    {
+      "name": "README_VSH_493_OVERWRITE_PATCH.txt",
+      "bytes": 3800,
+      "sha256": "fb85a4f120b9cecbd03cb978fadf5d6779f0ebf6cb7d9fa7ba032ded7cddc441"
+    },
+    {
+      "name": "theme/particles/xmb_native_dark_gradient.png",
+      "bytes": 40179,
+      "sha256": "0317efa6f161f9942bbc3ee898eb05197343da28cd45c1af9cc997185211e10e"
+    },
+    {
+      "name": "theme/particles/xmb_native_silk_back.png",
+      "bytes": 48187,
+      "sha256": "be8e5b505b1bccc518cd65cdbcc7f7d8d1f3d25fbeb0dda7a2da9c3f3e16c486"
+    },
+    {
+      "name": "theme/particles/xmb_native_silk_edge.png",
+      "bytes": 33466,
+      "sha256": "ac974bee236fdbc2262fd4ecf4e4323d8beb15e0f1969ce97243f5834fca91c0"
+    },
+    {
+      "name": "theme/particles/xmb_native_silk_front.png",
+      "bytes": 49938,
+      "sha256": "d5e8e6c65532ae3f4f35f9437262ae64f692f916ca306649a938f63d67ff51c5"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_01_day.png",
+      "bytes": 1002,
+      "sha256": "5f2b3ef601a6eff148de3203ac6af4c6f63bda56df54c9dcae3b2235f2e918f6"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_01_night.png",
+      "bytes": 255,
+      "sha256": "b68714fdc27f30b3a646c198f78744be065bf789590545f0f8f15626aec0c9c5"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_02_day.png",
+      "bytes": 2122,
+      "sha256": "6db4d5ecf1cedef1ac1c91fc9cf77ebd8c90e025243de1c96cbf76fa278b562d"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_02_night.png",
+      "bytes": 805,
+      "sha256": "4356bcd38d8209ddea6754bade9046c1302a43b0ea4a72d74c4431f8a68b56ed"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_03_day.png",
+      "bytes": 2161,
+      "sha256": "f1e3cd159608d27b4b447089b54ad16a93b4009164a1345e7be7f2f4fc62c8c9"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_03_night.png",
+      "bytes": 927,
+      "sha256": "d4cd1cffe6c2428811bf72fc5e3e7ed643768c01a170d95fe7e68b2e02e4b963"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_04_day.png",
+      "bytes": 2002,
+      "sha256": "44e8a2212c79b2854da3298e1bf3e5e0fd98da21a44891baba14b03e2ba487eb"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_04_night.png",
+      "bytes": 431,
+      "sha256": "aeaa342e2b2d5987de2387a1020efedb39de3f84011339bb1fcc96894e68b919"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_05_day.png",
+      "bytes": 464,
+      "sha256": "7a7b7b2a78e678ee40821bed21cad83139306c2c697960c4a2bb03c2093e84fc"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_05_night.png",
+      "bytes": 1195,
+      "sha256": "a18dc233497be5e728d520efde860e963052f283ee922eb94d933453fbe9fd1d"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_06_day.png",
+      "bytes": 1638,
+      "sha256": "6295eb96d1873d6bf8b060e2965417e608bf0a267907d2dc56ff4d5ca3bb46bb"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_06_night.png",
+      "bytes": 558,
+      "sha256": "f7f99edd86e6125fab3f3530612f2ee4ecdedc483159036b4e2d79805cce3591"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_07_day.png",
+      "bytes": 1263,
+      "sha256": "32b90fdbe521b14203f72926238da7a4c6c8cdf7cec3df7c929993c63b6308f4"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_07_night.png",
+      "bytes": 1199,
+      "sha256": "1673985fc17fcb49da5ee7a99e8861871d51c1b9cbbfc96122ec942a1b1b8ade"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_08_day.png",
+      "bytes": 2100,
+      "sha256": "4eb40f783afa51a221fd8a3a14979e8caf1f4a9734ae2721dd173f7d0b8f1fb4"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_08_night.png",
+      "bytes": 1341,
+      "sha256": "aefa58ffde2d66d2ce0f3aa37740622f9d6ecc41669cf7d3762c0cc02aef56da"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_09_day.png",
+      "bytes": 2061,
+      "sha256": "10712a43046b113d43d7329be89c51c0f152c05f286b359e457a7e75833be4b9"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_09_night.png",
+      "bytes": 946,
+      "sha256": "a4b05f5521e49bdabb5b04a122bed81ccee5cb8957e7fe2e8781033e34f9d15a"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_10_day.png",
+      "bytes": 1893,
+      "sha256": "ce61eed8c227f79da364e8c3602475f48b1ac9363fe011d5d588b8b62b86a5c0"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_10_night.png",
+      "bytes": 310,
+      "sha256": "a1ca152bbb79ee531405398abf45cc3787a8ff5cb93992906d20fb17514733ce"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_11_day.png",
+      "bytes": 166,
+      "sha256": "44d4385992f24bfec00850e34bc1106e45cae0a87c06ae72012fd680bbfd6443"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_11_night.png",
+      "bytes": 171,
+      "sha256": "e214f41e0694a8b18eadcc1a62740081a5c89a823625bf5812f366ac2280389b"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_12_day.png",
+      "bytes": 650,
+      "sha256": "476e844e8bada35dabae04133e67eb0c79f8d973dde7b57ac695abd3c113b28c"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_month_12_night.png",
+      "bytes": 1577,
+      "sha256": "f2aad565daa5c4060ac9d25cd743ab46b02c7134d0122c41d2d568dd691f6956"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_silk_back.png",
+      "bytes": 48139,
+      "sha256": "fc8f7f7690a941d42fdd62214db1aa4182f848657ff202c71cc4a32dfa0dc625"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_silk_edge.png",
+      "bytes": 32635,
+      "sha256": "4b85d14ce4bf535515f502322503405f5aa63fc3bb897a5e4441aa740d2d7033"
+    },
+    {
+      "name": "theme/particles/xmb_vsh_silk_front.png",
+      "bytes": 49881,
+      "sha256": "cc2436f80ff5870a561f4a721f80278ec62b4dfd6c50df0ce3b1c3862c5f6c17"
+    },
+    {
+      "name": "theme/theme.js",
+      "bytes": 679254,
+      "sha256": "b21f5898177c0cb1366b1df9ecd5dad6ac46311188017133de1cfe6e617f5199"
+    },
+    {
+      "name": "xmb_patch/tests/check_home_integration.js",
+      "bytes": 17509,
+      "sha256": "5566db735c19dedebaf9164ed3648eabc78d575c92e476f6cac0c093749ecb3a"
+    },
+    {
+      "name": "xmb_patch/tests/test_linkev_bridge.py",
+      "bytes": 945,
+      "sha256": "4587c4b83cdaf4bf0085a129fa5e0a7167e539257e4712a74b51a0398105cd3b"
+    },
+    {
+      "name": "xmb_patch/tests/test_v15_native_wave.py",
+      "bytes": 2330,
+      "sha256": "6c4abfffc6a2bb4e3be7ea14fcf71290c44b4ef677e2ac8b5a831311cc811e93"
+    },
+    {
+      "name": "xmb_patch/tests/test_vsh493_original_palette.py",
+      "bytes": 2317,
+      "sha256": "a62fd532de4f7d212493c988068bfcbc6108925fcc16895741398bb947ed2037"
+    },
+    {
+      "name": "xmb_patch/xmb_extension.js",
+      "bytes": 46251,
+      "sha256": "4ec5be72f51b1238f9c5cdcd7559b2e385d2cd76a6680fec83c0316ec05fe5b5"
+    },
+    {
+      "name": "xmb_research/ORIGINAL_VSH_PALETTE_INTEGRATION.md",
+      "bytes": 3944,
+      "sha256": "e5608cf60e5b14d34be82e0832d04081094d51761b6033d0c8c77e014bb16b6f"
+    },
+    {
+      "name": "xmb_research/ORIGINAL_VSH_PALETTE_NATIVE_WAVE_PREVIEW.jpg",
+      "bytes": 75501,
+      "sha256": "f95e5d91f7e5f362749b22cf8bab2d89b82c237a3c9ba13d8181455cc15ebf3b"
+    },
+    {
+      "name": "xmb_research/PS3_493_layout_factor_table_1080.txt",
+      "bytes": 498,
+      "sha256": "198c676854aa00ac3e40bc385cbc87755a0ed090c287d60b95fbe538a0cd3744"
+    },
+    {
+      "name": "xmb_research/PS3_493_layout_grid_table_1080.txt",
+      "bytes": 16912,
+      "sha256": "e4c0233eabe975a5ee632113a624f0b324d1e9db4f6c400f16bf7aae0a71f3c6"
+    },
+    {
+      "name": "xmb_research/README_LINKEV_AND_VSH.md",
+      "bytes": 4771,
+      "sha256": "9b16c3ecf47a2fce3e0b4f83ff7e7ce89fa436fec0780cb487240bfdf8c13047"
+    },
+    {
+      "name": "xmb_research/VSH_QRC_INDEX_REPORT.json",
+      "bytes": 33010,
+      "sha256": "e3058b474f73ee778f7c2642b270cccf7ba3bef4c1d5abac5ec59198798be424"
+    },
+    {
+      "name": "xmb_research/capture_linkev_wave.py",
+      "bytes": 7459,
+      "sha256": "8fa4939bbbac11c34d5a2513420c3664e39f1e7cf0d5128703e0b34863469edb"
+    },
+    {
+      "name": "xmb_research/extract_indexed_vsh_palettes.py",
+      "bytes": 6161,
+      "sha256": "d40fb96584532d27bd3a3d15580d5eb193d337c44e6f8f84235bf7caf784dc64"
+    },
+    {
+      "name": "xmb_research/map_rcoxml_1080.py",
+      "bytes": 1980,
+      "sha256": "13696d88dcc9b1c6275be4928ab63c1c75b9b73fdcfa74912f14bb2509574025"
+    }
+  ]
+}

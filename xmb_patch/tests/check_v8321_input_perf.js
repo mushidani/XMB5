@@ -1,0 +1,64 @@
+'use strict';
+// Host-side deterministic input tests: no PS5 frame-time or latency measurement.
+const fs=require('fs'), path=require('path'), vm=require('vm'), assert=require('assert');
+const b=fs.readFileSync(path.join(__dirname,'../xmb_native_bundle.js'),'utf8');
+const e=fs.readFileSync(path.join(__dirname,'../xmb_extension.js'),'utf8');
+const start=b.indexOf('        function createController(categories, opts) {');
+const end=b.indexOf('        const FILL = ',start);
+let now=1000, calls=[], timers=0, reads=0, notifications=0;
+class Value { constructor(v){this.value=v;this.writes=0;} stopAnimation(){} setValue(v){this.value=v;this.writes++;} __getValue(){return this.value;} interpolate(c){return {node:this,config:c};} }
+const Animated={Value,timing:(value,config)=>({start(){calls.push({value,config});}}),View:'Animated.View'};
+const core={ease:{outCubic:u=>1-(1-u)**3,smooth:u=>u*u*(3-2*u),linear:u=>u}, repeatIntervals:()=>[210,105],SUB:{PS3:{arrowFrom:30}}};
+const V={W:1920,H:1080,CAT_SPACING:203,CAT_ANIM_MS:250,ITEM_ANIM_MS:200,SUBMENU_ANIM_MS:250};
+const create=vm.runInNewContext(b.slice(start,end)+'\ncreateController',{Animated,V,core,nativeDriver:true,Math,Date:{now:()=>now},setTimeout:()=>++timers,clearTimeout:()=>{},interp:(v,t)=>v.interpolate(t)});
+const items=Array.from({length:30},(_,i)=>({n:'Title '+i}));
+const cats=Array.from({length:4},(_,i)=>({id:'c'+i,get items(){reads++;return items;}}));
+const ctl=create(cats,{startCategory:0});
+ctl.subscribe(()=>notifications++);
+ctl.sync({ci:0,sel:[0,0,0,0],stack:[],startDelay:100});
+assert.equal(ctl.state.startDelay,0,'old preference must not add delay');
+reads=0;
+for(let i=1;i<=15;i++){
+  now+=32;calls=[];
+  assert(ctl.syncCursor(0,[i,0,0,0],0,0));
+  assert.equal(calls.length,1,'only the real root motion starts on vertical step');
+  assert.equal(calls[0].value,ctl.rootPos[0]);
+  assert.equal(calls[0].config.delay,0);
+  assert.equal(calls[0].config.toValue,i);
+}
+assert.equal(reads,0,'cursor-only model does not rebuild lists');
+assert.equal(notifications,0,'no immediate React refresh');
+assert.equal(timers,0,'no unused fast-rest timers');
+assert(ctl.exitGhostPos.every(v=>v.writes===0),'ghost position graph never changes on vertical steps');
+now+=10;calls=[];
+assert(ctl.syncCursor(1,[15,0,0,0],0,0));
+assert.equal(calls[0].value,ctl.catPos,'main horizontal animation queued before ghost');
+assert.equal(calls[0].config.delay,0);
+assert.equal(ctl.exitGhostPos[0].writes,1,'outgoing ghost samples its position only at exit');
+assert(calls.find(c=>c.value===ctl.exitGhostT[0]&&c.config.duration===100));
+assert(calls.find(c=>c.value===ctl.exitAlpha[0]&&c.config.duration===110));
+now+=32;calls=[];
+assert(ctl.syncCursor(0,[15,0,0,0],0,0));
+assert.equal(ctl.exitMode[0].value,0,'rapid reversal clears incoming trail');
+assert(!ctl.syncCursor(0,[15,0,0,0],0,0),'no change needs no animation');
+assert(!ctl.syncCursor(0,[20,0,0,0],0,0),'nonadjacent jumps use full sync');
+assert(!ctl.syncCursor(0,[15,1,0,0],0,0),'other selections changed: use full sync');
+ctl.sync({ci:0,sel:[15,0,0,0],stack:[{items,idx:0,title:'Submenu'}]});
+calls=[];assert(ctl.syncCursor(0,[15,0,0,0],1,1));
+assert.equal(calls.length,1);assert.equal(calls[0].value,ctl.state.stack[0].pos);assert.equal(calls[0].config.delay,0);
+// Real host move handler: actual boundary behavior, including launch callback preservation.
+const hs=e.indexOf('  function xmbMove(dir) {'),he=e.indexOf('  /* V83: keep the wave hidden',hs);
+let redraw=0, moves=0, sounds=0;
+const home={category:0,cats:[{},{}],cursor:[0,0],webStack:[],onLaunch:()=>{},inputLogCount:20};
+const context={xmbHome:home,xmbEnabled:()=>true,xmbIntroSkip:()=>false,xmbInputSeen:()=>{},xmbItems:()=>[{},{}],xmbNotify:()=>redraw++,xmbMoveNotify:()=>moves++,xmbPlaySfx:()=>sounds++,log:()=>{},Math};
+const move=vm.runInNewContext(e.slice(hs,he)+'\nxmbMove',context);
+const launch=home.onLaunch;
+move('up');move('left');assert.equal(redraw+moves+sounds,0);assert.strictEqual(home.onLaunch,launch);
+move('down');assert.equal(moves,1);assert.equal(sounds,1);move('down');assert.equal(redraw,0);assert.equal(moves,1);
+home.webStack=[{cursor:0,entries:[{},{}]}];home.onLaunch=launch;move('up');assert.strictEqual(home.onLaunch,launch);assert.equal(redraw,0);
+move('down');assert.equal(moves,2);assert.equal(sounds,2);
+assert(b.includes('pos: p.ghostPos || pos, ghostOnly: true, noGlow: true'));
+assert(b.includes('ghostPos: ctl.exitGhostPos[c]'));
+assert(e.includes('xmbNativeInstance.preMove(xmbHome.category'));
+assert(e.includes('if (xmbIconPending[src]) { xmbIconPending[src].push(cb); return; }'));
+console.log('PASS V83.21: direct cursor dispatch; zero requested start delay; no boundary refresh; no vertical ghost graph updates; unchanged horizontal ghost + submenu motion');

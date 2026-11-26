@@ -1,0 +1,17 @@
+{
+  "version": "V30 xmb-web alpha preview",
+  "files": {
+    "xmb_patch/xmb_extension.js": {
+      "before_sha256": "ce3c0c80bc852ae1ac8ce9ce62638bf16bb5075824f3202af73cf27e250d49bf",
+      "after_sha256": "602518b088cba76bea3a20acc3d5efd4e94e7c245c867ddee50122431290d84b",
+      "backup": "xmb_patch/xmb_extension.js.before_V30_xmbweb_alpha.bak"
+    },
+    "theme/theme.js": {
+      "before_sha256": "31a3d437b802ee38e4cb91dd00e442391cdd3b7836436224f5ee2c496812bb08",
+      "after_sha256": "1827311f0eeb85302574f8e29cf79eea1aeacc0d7c92c20bdf768ff6400093d5",
+      "backup": "theme/theme.js.before_V30_xmbweb_alpha.bak"
+    }
+  },
+  "reference": "TheGammaSqueeze/xmb-web index.html V.CAT_INACTIVE_ALPHA 0.9, V.CAT_FAR_ALPHA 0.25, V.ALPHA_INACTIVE 0.48; far-alpha source vaddr NOT independently confirmed",
+  "scope": "Native React opacity only; no rendering geometry, wave, controller changes"
+}

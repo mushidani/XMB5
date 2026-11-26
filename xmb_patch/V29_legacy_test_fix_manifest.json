@@ -1,0 +1,16 @@
+{
+  "version": "V29-test-only-80-unit-fix",
+  "files": {
+    "xmb_patch/tests/test_v17_geometry_and_linkev.py": {
+      "backup": "xmb_patch/tests/test_v17_geometry_and_linkev.py.before_V29_legacy_test_fix.bak",
+      "before": "1a7bfba06fdd59297f607a81b7c51c22c03863bb900b430a3ccbc8ad8feb253d",
+      "after": "4a9193285e8c6c69d4180e6439efbfdcb852ab0f1e74bae917290fe150ab872e"
+    },
+    "xmb_patch/tests/check_home_integration.js": {
+      "backup": "xmb_patch/tests/check_home_integration.js.before_V29_legacy_test_fix.bak",
+      "before": "a7836decb637caa66219499cef1bc1e16b6befbe39485d490d6336048c3fb210",
+      "after": "608a20972f298f33e006ef650655c3e1b1549e991819dec28a3e565552b8af6f"
+    }
+  },
+  "note": "Test assertions ONLY; XMB source and ELF unchanged"
+}
