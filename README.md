@@ -105,46 +105,13 @@ Available builds can be found on the [GitHub Releases](https://github.com/mushid
 
 To restore the original interface, navigate to **PS5 XMB Controls → Return to PS5 Home**.
 
-## Building from Source
-
-### Requirements
-
-- Linux or Windows Subsystem for Linux (WSL).
-- PS5 Payload SDK.
-- Python 3.
-- CMake.
-- Ninja.
-- Node.js.
-- Required locally supplied assets.
-
-### Build
-
-```bash
-git clone https://github.com/mushidani/XMB5.git
-cd XMB5
-```
-
-Provide the required local assets and install the build dependencies before running:
-
-```bash
-bash BUILD_XMB_HOME_WSL.sh
-```
-
-The compiled payload will be available at:
-
-```text
-release/XMB5.elf
-```
-
-Locally supplied fonts, sounds and artwork with unverified redistribution rights are not included in the public source repository.
-
 ## Development Status
 
 XMB5 is currently in public beta.
 
 Some features, animations and firmware-specific behavior may require further refinement. Community feedback and testing are appreciated.
 
-If you encounter an issue, please include your firmware version, jailbreak environment, XMB5 version and relevant logs.
+If you encounter an issue, please include your firmware version, jailbreak environment, XMB5 version and relevant logs. Remove any personal information from logs before sharing them.
 
 [Report a bug or request a feature](https://github.com/mushidani/XMB5/issues)
 
@@ -158,19 +125,14 @@ Special thanks to:
 | :--- | :--- |
 | [ZhiThemes by Zhi](https://github.com/itsRealZhi/ZhiThemes) | Native PS5 theme engine |
 | [xmb-web by TheGammaSqueeze](https://github.com/TheGammaSqueeze/xmb-web) | XMB rendering and visual reference |
-| [OnionHEN](https://github.com/aydencharles/onionHEN) | Native PS5 infrastructure |
-| AniketosHEN | Native customization techniques |
-| PlayStation homebrew community | Research, testing and development |
 
 XMB5 is a modified project based on ZhiThemes.
 
-See [CREDITS.md](CREDITS.md) and [NOTICE](NOTICE) for additional attribution.
+See [CREDITS.md](CREDITS.md) and [NOTICE](NOTICE) for full upstream and third-party attribution.
 
 ## License
 
-XMB5 is licensed under the GNU General Public License
-version 3 or later, subject to the additional attribution
-requirements specified in NOTICE.
+XMB5 is licensed under the GNU General Public License version 3 or later, subject to the additional attribution requirements specified in NOTICE.
 
 Third-party assets retain their respective licenses.
 
@@ -178,9 +140,7 @@ See [LICENSE](LICENSE) for more information.
 
 ## Disclaimer
 
-XMB5 is an independent, unofficial homebrew project.
-It is not affiliated with, endorsed by or sponsored by
-Sony Interactive Entertainment.
+XMB5 is an independent, unofficial homebrew project. It is not affiliated with, endorsed by or sponsored by Sony Interactive Entertainment.
 
 Use at your own discretion.
 
