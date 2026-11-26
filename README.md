@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/previews/preview-2.png" width="100%" alt="XMB5 Home Screen">
+  <img src="docs/previews/preview-1.png" width="100%" alt="XMB5 Home Screen">
 </p>
 
 ## Overview
