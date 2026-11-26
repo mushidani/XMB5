@@ -61,7 +61,7 @@ XMB5 is more than a visual theme. It introduces a completely different way to na
 <table>
   <tr>
     <td width="50%">
-      <img src="docs/previews/preview-1.png" alt="Dynamic Game Background">
+      <img src="docs/previews/preview-2.png" alt="Dynamic Game Background">
       <p align="center"><b>Dynamic Game Backgrounds</b></p>
     </td>
     <td width="50%">
